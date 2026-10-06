@@ -1,0 +1,86 @@
+# Virtual environments
+.venv/
+.bootstrap/
+.python310/
+.uvcache/
+venv/
+env/
+ENV/
+
+# Python cache & build
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Environment variables & secrets
+.env
+.env.*
+
+# Logs & temp files
+*.log
+logs/*
+tmp/
+temp/
+
+# Large Model Checkpoints & Artifacts
+checkpoints/*
+artifacts/*
+features/*
+*.pt
+*.pth
+*.bin
+*.onnx
+*.engine
+*.tflite
+*.h5
+
+# Dataset files & Videos (Avoid large file uploads to GitHub)
+dataset/raw/
+dataset/videos/
+dataset/train/*
+dataset/val/*
+dataset/test/*
+dataset/metadata/*.csv
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.zip
+*.tar
+*.gz
+*.rar
+*.7z
+
+# Reports & plots generated
+reports/*.json
+reports/plots/*
+
+# Documents (Báo cáo, tài liệu Word, Office per user request)
+*.doc
+*.docx
+*.docm
+*.dotx
+~$*.doc*
+~$*.docx*
+*.ppt
+*.pptx
+*.xls
+*.xlsx
+*.pdf
+build_de_cuong_word.py
+*de_cuong*
+
+# OS & Editor specific files
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo

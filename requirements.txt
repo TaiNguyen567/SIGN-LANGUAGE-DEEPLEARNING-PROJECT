@@ -1,0 +1,12 @@
+# Use Python 3.10 on Windows. Install the CUDA-enabled torch wheel first when available.
+torch==2.7.1
+numpy==1.26.4
+opencv-contrib-python==4.10.0.84
+mediapipe==0.10.18
+pandas==2.2.3
+PyYAML==6.0.2
+matplotlib==3.9.4
+tqdm==4.67.1
+Pillow==11.3.0
+pyttsx3==2.98
+pytest==8.3.5
