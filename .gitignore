@@ -46,6 +46,10 @@ dataset/train/*
 dataset/val/*
 dataset/test/*
 dataset/metadata/*.csv
+dataset/Processed/
+dataset/Dataset/
+.tmp_pytest/
+.tmp_render_detail/
 *.mp4
 *.avi
 *.mov

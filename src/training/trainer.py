@@ -47,7 +47,7 @@ class Trainer:
             weight_decay=float(training.get("weight_decay", 1e-4)),
         )
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, mode="min", factor=0.5, patience=2,
+            self.optimizer, mode="min", factor=0.5, patience=int(training.get("lr_scheduler_patience", 2)),
         )
         self.criterion = CTCLoss(blank_id=tokenizer.blank_id)
         self.decoder = CTCGreedyDecoder(blank_id=tokenizer.blank_id)
@@ -57,17 +57,48 @@ class Trainer:
         self.logger = logging.getLogger("sign_language_ai.training")
         self.csv_path = self.log_dir / "training.csv"
 
-    def fit(self, train_loader: DataLoader, val_loader: DataLoader, epochs: int, patience: int = 8) -> list[dict[str, float]]:
+    def resume_from_checkpoint(self, checkpoint_path: Path, override_lr: float | None = None) -> tuple[int, float]:
+        """Restore model, optimizer, and scheduler states from a saved checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if override_lr is not None:
+            for param_group in self.optimizer.param_groups:
+                param_group["lr"] = float(override_lr)
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode="min",
+                factor=0.5,
+                patience=int(self.config.get("training", {}).get("lr_scheduler_patience", 2)),
+            )
+        elif "scheduler_state_dict" in checkpoint:
+            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        start_epoch = int(checkpoint.get("epoch", 0)) + 1
+        best_val_loss = float(checkpoint.get("best_val_loss", float("inf")))
+        self.logger.info("Resumed checkpoint %s at epoch %d (best_val_loss=%.4f, lr=%.2e)", checkpoint_path.name, start_epoch, best_val_loss, self.optimizer.param_groups[0]["lr"])
+        return start_epoch, best_val_loss
+
+    def fit(
+        self,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        epochs: int,
+        patience: int = 8,
+        start_epoch: int = 1,
+        initial_best_val_loss: float = float("inf"),
+    ) -> list[dict[str, float]]:
         if epochs < 1 or patience < 1:
             raise ValueError("epochs and early-stopping patience must be positive")
         if len(train_loader) == 0 or len(val_loader) == 0:
             raise ValueError("Training and validation datasets must both contain at least one batch")
-        self.csv_path.unlink(missing_ok=True)
+        if start_epoch <= 1:
+            self.csv_path.unlink(missing_ok=True)
         history: list[dict[str, float]] = []
-        best_val_loss = float("inf")
-        best_epoch = 0
+        best_val_loss = initial_best_val_loss
+        best_epoch = start_epoch - 1 if initial_best_val_loss < float("inf") else 0
         stale_epochs = 0
-        for epoch in range(1, epochs + 1):
+        for epoch in range(start_epoch, epochs + 1):
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
             train_result = self._run_epoch(train_loader, training=True)
@@ -89,8 +120,8 @@ class Trainer:
             history.append(row)
             self._append_csv(row)
             self.logger.info(
-                "epoch=%d train_loss=%.4f val_loss=%.4f CER=%.4f WER=%.4f lr=%.2e",
-                epoch, row["train_loss"], row["val_loss"], row["cer"], row["wer"], learning_rate,
+                "epoch=%d train_loss=%.4f val_loss=%.4f CER=%.4f WER=%.4f acc=%.2f%% lr=%.2e",
+                epoch, row["train_loss"], row["val_loss"], row["cer"], row["wer"], row["sentence_accuracy"] * 100.0, learning_rate,
             )
 
             improved = val_result["loss"] < best_val_loss
@@ -115,7 +146,7 @@ class Trainer:
         references: list[str] = []
         hypotheses: list[str] = []
         iterator = tqdm(loader, leave=False, disable=True, desc="train" if training else "validation")
-        for batch in iterator:
+        for step, batch in enumerate(iterator):
             features = batch["features"].to(self.device, non_blocking=True)
             targets = batch["targets"].to(self.device, non_blocking=True)
             input_lengths = batch["input_lengths"]
@@ -133,6 +164,8 @@ class Trainer:
                     clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
+                    if (step + 1) % 200 == 0 or (step + 1) == len(loader):
+                        self.logger.info("train step %d/%d (%.1f%%) batch_loss=%.4f", step + 1, len(loader), (step + 1) * 100.0 / len(loader), loss.item())
 
             batch_size = features.shape[0]
             loss_total.add_(loss.detach().float() * batch_size)

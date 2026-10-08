@@ -31,6 +31,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:N")
+    parser.add_argument("--resume", action="store_true", help="Resume from last_model.pt if available")
+    parser.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--epochs", type=int, default=None, help="Override epochs count")
+    parser.add_argument("--batch-size", type=int, default=None, help="Override batch size")
+    parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
     args = parser.parse_args()
     try:
         config = load_config(resolve_project_path(args.config, project_root=ROOT))
@@ -45,10 +50,14 @@ def main() -> int:
         train_frame = pd.read_csv(metadata, keep_default_na=False)
         if train_frame.empty:
             raise ValueError(f"Training dataset is empty: {metadata}")
-        token_column = train_frame["token_text"] if "token_text" in train_frame.columns else train_frame["text"]
-        tokenizer = SignTokenizer.build(token_column.astype(str))
-        vocab_path = resolve_project_path("artifacts/vocab.json", project_root=ROOT)
-        tokenizer.save(vocab_path)
+        vocab_setting = paths.get("vocab_file", "artifacts/vocab.json") if isinstance(paths, dict) else "artifacts/vocab.json"
+        vocab_path = resolve_project_path(vocab_setting, project_root=ROOT)
+        if vocab_path.is_file():
+            tokenizer = SignTokenizer.load(vocab_path)
+        else:
+            token_column = train_frame["token_text"] if "token_text" in train_frame.columns else train_frame["text"]
+            tokenizer = SignTokenizer.build(token_column.astype(str))
+            tokenizer.save(vocab_path)
 
         seed = int(config.get("project", {}).get("seed", 42))
         random.seed(seed)
@@ -75,9 +84,12 @@ def main() -> int:
         )
         val_set = SignLanguageDataset(validation_metadata, tokenizer, project_root=ROOT, feature_config=feature_config)
         training = config.get("training", {})
+        if args.lr is not None:
+            training["learning_rate"] = args.lr
+        batch_size = int(args.batch_size if args.batch_size is not None else training.get("batch_size", 64))
         workers = int(training.get("num_workers", 0))
         common_loader_args = {
-            "batch_size": int(training.get("batch_size", 8)),
+            "batch_size": batch_size,
             "num_workers": workers,
             "collate_fn": ctc_collate_fn,
             "pin_memory": device.type == "cuda",
@@ -86,18 +98,38 @@ def main() -> int:
         train_loader = DataLoader(train_set, shuffle=True, **common_loader_args)
         val_loader = DataLoader(val_set, shuffle=False, **common_loader_args)
         log_dir = resolve_project_path(paths.get("log_dir", "logs"), project_root=ROOT)
+        checkpoint_dir = resolve_project_path(paths.get("checkpoint_dir", "checkpoints"), project_root=ROOT)
         logger = configure_logger("sign_language_ai.training", log_dir / "train.log", console=True)
         info = get_device_info(device)
         logger.info("device=%s feature_dim=%d vocabulary=%d", format_device_info(info), feature_config.feature_dim, tokenizer.vocabulary_size)
         trainer = Trainer(
             model, tokenizer, device=device, config=config,
-            checkpoint_dir=resolve_project_path(paths.get("checkpoint_dir", "checkpoints"), project_root=ROOT),
+            checkpoint_dir=checkpoint_dir,
             log_dir=log_dir,
         )
+        start_epoch = 1
+        best_val_loss = float("inf")
+        resume_target = None
+        if args.resume_from:
+            resume_target = resolve_project_path(args.resume_from, project_root=ROOT)
+        elif args.resume:
+            best_ckpt = checkpoint_dir / "best_model.pt"
+            last_ckpt = checkpoint_dir / "last_model.pt"
+            resume_target = best_ckpt if best_ckpt.is_file() else last_ckpt
+
+        if resume_target is not None:
+            if resume_target.is_file():
+                start_epoch, best_val_loss = trainer.resume_from_checkpoint(resume_target, override_lr=args.lr)
+            else:
+                logger.warning("Checkpoint %s not found to resume from. Starting from epoch 1.", resume_target)
+
+        total_epochs = int(args.epochs if args.epochs is not None else training.get("epochs", 20))
         history = trainer.fit(
             train_loader, val_loader,
-            epochs=int(training.get("epochs", 50)),
-            patience=int(training.get("early_stopping_patience", 8)),
+            epochs=total_epochs,
+            patience=int(training.get("early_stopping_patience", 6)),
+            start_epoch=start_epoch,
+            initial_best_val_loss=best_val_loss,
         )
         print(f"Training finished after {len(history)} epochs. Best checkpoint: checkpoints/best_model.pt")
         return 0

@@ -16,10 +16,18 @@ class DecodedOutput:
 class CTCGreedyDecoder:
     """Collapse repeated labels and blanks in the most likely CTC path."""
 
-    def __init__(self, blank_id: int = 0) -> None:
+    def __init__(
+        self,
+        blank_id: int = 0,
+        *,
+        fallback_non_blank: bool = True,
+        min_fallback_confidence: float = 0.001,
+    ) -> None:
         if blank_id < 0:
             raise ValueError("blank_id must be non-negative")
         self.blank_id = blank_id
+        self.fallback_non_blank = fallback_non_blank
+        self.min_fallback_confidence = min_fallback_confidence
 
     def decode(
         self,
@@ -56,6 +64,17 @@ class CTCGreedyDecoder:
                     token_ids.append(current)
                     token_confidences.append(float(frame_confidence))
                 previous = current
+
+            if not token_ids and self.fallback_non_blank and limit > 0 and classes > 1:
+                seq_lp = log_probs[:limit, batch_index].detach().clone()
+                seq_lp[:, self.blank_id] = -float("inf")
+                max_val, max_idx = torch.max(seq_lp.reshape(-1), dim=0)
+                best_token = (max_idx % classes).item()
+                best_conf = float(torch.exp(max_val).item())
+                if best_conf >= self.min_fallback_confidence:
+                    token_ids.append(best_token)
+                    token_confidences.append(best_conf)
+
             confidence = sum(token_confidences) / len(token_confidences) if token_confidences else 0.0
             outputs.append(DecodedOutput(tuple(token_ids), confidence))
         return outputs

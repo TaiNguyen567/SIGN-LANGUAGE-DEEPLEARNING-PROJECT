@@ -39,13 +39,15 @@ def evaluate(checkpoint_path: Path, config_path: Path, metadata_path: Path | Non
     )
     test_csv = metadata_path or resolve_project_path(config["data"]["test_metadata"], project_root=ROOT)
     dataset = SignLanguageDataset(test_csv, tokenizer, project_root=ROOT, feature_config=feature_config)
+    workers = int(config.get("training", {}).get("num_workers", 0))
     loader = DataLoader(
         dataset,
-        batch_size=int(config.get("training", {}).get("batch_size", 8)),
+        batch_size=int(config.get("training", {}).get("batch_size", 64)),
         shuffle=False,
-        num_workers=0,
+        num_workers=workers,
         collate_fn=ctc_collate_fn,
         pin_memory=device.type == "cuda",
+        persistent_workers=workers > 0,
     )
     criterion = CTCLoss(blank_id=tokenizer.blank_id)
     decoder = CTCGreedyDecoder(blank_id=tokenizer.blank_id)
@@ -58,7 +60,8 @@ def evaluate(checkpoint_path: Path, config_path: Path, metadata_path: Path | Non
         for batch in loader:
             features = batch["features"].to(device, non_blocking=True)
             targets = batch["targets"].to(device, non_blocking=True)
-            log_probs = model(features, batch["input_lengths"])
+            with torch.amp.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                log_probs = model(features, batch["input_lengths"])
             loss = criterion(log_probs, targets, batch["input_lengths"], batch["target_lengths"])
             batch_size = features.shape[0]
             total_loss.add_(loss.detach().float() * batch_size)

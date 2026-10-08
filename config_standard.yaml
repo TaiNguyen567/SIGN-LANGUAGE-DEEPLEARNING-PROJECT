@@ -2,35 +2,48 @@ project:
   name: sign_language_ai
   seed: 42
   development_mode: true
-
 data:
-  train_metadata: dataset/metadata/train_basic.csv
-  val_metadata: dataset/metadata/val_basic.csv
-  test_metadata: dataset/metadata/test_basic.csv
+  train_metadata: dataset/metadata/train_standard.csv
+  val_metadata: dataset/metadata/val_standard.csv
+  test_metadata: dataset/metadata/test_standard.csv
   sequence_length: 60
   stride: 8
   video_column: video_path
   text_column: text
   language_column: language
-
 features:
   layout: vsl_201
   use_hands: true
   use_pose: true
   use_face: false
-  face_landmark_indices: [1, 10, 33, 61, 70, 105, 133, 152, 159, 234, 263, 291, 300, 334, 362, 386, 454]
+  face_landmark_indices:
+  - 1
+  - 10
+  - 33
+  - 61
+  - 70
+  - 105
+  - 133
+  - 152
+  - 159
+  - 234
+  - 263
+  - 291
+  - 300
+  - 334
+  - 362
+  - 386
+  - 454
   min_visibility: 0.5
   model_complexity: 1
-
 model:
   d_model: 256
   nhead: 8
   num_layers: 4
   dim_feedforward: 1024
   dropout: 0.1
-  num_classes: 49
+  num_classes: 118
   blank_id: 0
-
 training:
   batch_size: 64
   epochs: 20
@@ -41,18 +54,18 @@ training:
   lr_scheduler_patience: 3
   num_workers: 4
   mixed_precision: true
-
 augmentation:
   enabled: true
   gaussian_noise_std: 0.01
-  scale_range: [0.95, 1.05]
+  scale_range:
+  - 0.95
+  - 1.05
   translation_std: 0.01
   rotation_degrees: 5.0
   temporal_crop_probability: 0.2
   temporal_stretch_probability: 0.2
   frame_drop_probability: 0.05
   landmark_mask_probability: 0.02
-
 realtime:
   camera_id: 0
   width: 1280
@@ -66,21 +79,18 @@ realtime:
   motion_threshold: 0.015
   show_landmarks: true
   require_hand: false
-
 translation:
   language: vi
   reordering_rules: {}
-
 tts:
   enabled: true
   rate: 165
   volume: 1.0
-
 paths:
   dataset_dir: dataset
   features_dir: features
-  checkpoint_dir: checkpoints
+  checkpoint_dir: checkpoints_standard
   artifact_dir: artifacts
   log_dir: logs
   report_dir: reports
-  vocab_file: artifacts/vocab_basic.json
+  vocab_file: artifacts/vocab_standard.json

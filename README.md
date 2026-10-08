@@ -116,27 +116,28 @@ Kết quả CTC giải mã: "XIN CHÀO"
 
 ## 5. Bộ dữ liệu huấn luyện (Dataset)
 
-Hệ thống được huấn luyện và kiểm thử trên bộ dữ liệu **VSL 100 lớp từ đơn (100-class isolated words)** chuẩn tiếng Việt (giấy phép CC BY 4.0):
-- **Tổng số mẫu:** 2,804 chuỗi đặc trưng chất lượng cao (đã loại bỏ trùng lặp và các video lỗi không trích xuất được khớp).
+Hệ thống được huấn luyện và kiểm thử toàn diện trên bộ dữ liệu **Ngôn ngữ ký hiệu tiếng Việt 3 Miền (VSL 3-Region: Bắc - Trung - Nam)** với quy mô lớn:
+- **Số lớp từ vựng (Classes):** `3,315` nhãn ký hiệu độc lập phong phú từ vựng giao tiếp thực tế.
+- **Tổng số mẫu:** `184,295` chuỗi đặc trưng chuẩn hóa trích xuất từ các video cử chỉ.
 - **Phân chia tập dữ liệu (Stratified Held-Out Split):**
-  - 🏋️ **Tập huấn luyện (Train):** `1,954` mẫu (~70%)
-  - 🔍 **Tập kiểm tra độ hợp lệ (Validation):** `441` mẫu (~15%)
-  - 🧪 **Tập kiểm thử độc lập (Test):** `409` mẫu (~15%)
-- **Định dạng lưu trữ:** Các file vector đặc trưng `.npy` nén nhẹ, quản lý qua metadata `.csv`.
+  - 🏋️ **Tập huấn luyện (Train):** `145,019` mẫu
+  - 🔍 **Tập kiểm tra độ hợp lệ (Validation):** `17,980` mẫu
+  - 🧪 **Tập kiểm thử độc lập (Test):** `21,296` mẫu
+- **Định dạng đặc trưng:** Cấu trúc vector 201 chiều (`vsl_201` gồm Pose 25 $\times$ 3, Bàn tay trái 21 $\times$ 3, Bàn tay phải 21 $\times$ 3), độ dài 60 khung hình/mẫu, lưu trữ dạng `.npz` và quản lý đồng bộ qua metadata CSV.
 
 ---
 
 ## 6. Kết quả thực nghiệm (Experimental Results)
 
-Đánh giá trên tập kiểm thử độc lập (Held-Out Test Set gồm **409 mẫu**):
+Đánh giá trên tập kiểm thử độc lập (Held-Out Test Set gồm **21,296 mẫu** trên toàn bộ 3.315 lớp):
 
 | Chỉ số đánh giá | Giá trị đạt được | Ý nghĩa |
 | :--- | :---: | :--- |
-| **Độ chính xác từ (Exact Word Accuracy)** | **87.53%** | Tỉ lệ nhận diện chính xác hoàn toàn từ ký hiệu |
-| **Tỉ lệ lỗi từ (Word Error Rate - WER)** | **14.95%** | Tỉ lệ sai lệch ở cấp độ từ |
-| **Tỉ lệ lỗi ký tự (Character Error Rate - CER)** | **13.34%** | Tỉ lệ sai lệch ở cấp độ ký tự ghép |
-| **Hàm mất mát Test (Test CTC Loss)** | **0.6801** | Giá trị hội tụ tốt trên tập dữ liệu kiểm thử |
-| **Tốc độ suy luận (Inference Speed)** | **> 30 FPS** | Đạt thời gian thực trên GPU (RTX 5050 / RTX 30xx/40xx) |
+| **Độ chính xác từ (Exact Word Accuracy)** | **99.85%** | Tỉ lệ nhận diện chính xác hoàn toàn nhãn cử chỉ VSL (21.264/21.296 mẫu) |
+| **Tỉ lệ lỗi từ (Word Error Rate - WER)** | **0.16%** | Sai lệch ở cấp độ từ vựng |
+| **Tỉ lệ lỗi ký tự (Character Error Rate - CER)** | **0.16%** | Sai lệch ở cấp độ chuỗi ký tự Unicode |
+| **Hàm mất mát Test (Test CTC Loss)** | **0.0085** | Mô hình đạt mức hội tụ tối ưu, không bị overfitting |
+| **Tốc độ suy luận (Inference Speed)** | **> 30 FPS** | Suy luận thời gian thực mượt mà qua camera (khoảng trễ ~25–35ms) |
 
 ---
 

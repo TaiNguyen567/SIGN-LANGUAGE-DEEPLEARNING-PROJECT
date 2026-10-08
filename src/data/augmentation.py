@@ -17,15 +17,23 @@ class LandmarkAugmenter:
 
     def __call__(self, sequence: np.ndarray) -> np.ndarray:
         values = np.asarray(sequence, dtype=np.float32)
-        if values.ndim != 2 or values.shape[1] % 4 != 0:
-            raise ValueError("Landmark augmentation expects shape [T, 4 * number_of_points]")
+        if values.ndim != 2:
+            raise ValueError("Landmark augmentation expects 2D sequence [T, F]")
         if not self.enabled:
             return values.copy()
 
         values = self._temporal_augment(values)
-        points = values.reshape(values.shape[0], -1, 4).copy()
-        coords = points[:, :, :3]
-        visible = points[:, :, 3] > 0.5
+        if values.shape[1] % 4 == 0:
+            points = values.reshape(values.shape[0], -1, 4).copy()
+            coords = points[:, :, :3]
+            visible = points[:, :, 3] > 0.5
+            has_valid_dim = True
+        elif values.shape[1] % 3 == 0:
+            coords = values.reshape(values.shape[0], -1, 3).copy()
+            visible = np.any(coords != 0.0, axis=-1)
+            has_valid_dim = False
+        else:
+            raise ValueError(f"Unexpected landmark feature dimension: {values.shape[1]}")
 
         noise_std = float(self.config.get("gaussian_noise_std", 0.0))
         if noise_std > 0:
@@ -49,16 +57,20 @@ class LandmarkAugmenter:
             x_values, y_values = coords[:, :, 0].copy(), coords[:, :, 1].copy()
             coords[:, :, 0] = cosine * x_values - sine * y_values
             coords[:, :, 1] = sine * x_values + cosine * y_values
-
         mask_probability = float(self.config.get("landmark_mask_probability", 0.0))
-        if mask_probability > 0:
-            hidden = self.rng.random(visible.shape) < mask_probability
-            visible &= ~hidden
+        if has_valid_dim:
+            if mask_probability > 0:
+                hidden = self.rng.random(visible.shape) < mask_probability
+                visible &= ~hidden
+                points[:, :, 3] = visible.astype(np.float32)
             coords[~visible] = 0.0
-            points[:, :, 3] = visible.astype(np.float32)
-
-        coords[~visible] = 0.0
-        return points.reshape(values.shape[0], -1).astype(np.float32, copy=False)
+            return points.reshape(values.shape[0], -1).astype(np.float32, copy=False)
+        else:
+            if mask_probability > 0:
+                hidden = self.rng.random(visible.shape) < mask_probability
+                visible &= ~hidden
+            coords[~visible] = 0.0
+            return coords.reshape(values.shape[0], -1).astype(np.float32, copy=False)
 
     def _temporal_augment(self, sequence: np.ndarray) -> np.ndarray:
         values = sequence
@@ -73,8 +85,6 @@ class LandmarkAugmenter:
             output_count = max(2, int(round(values.shape[0] * factor)))
             source_positions = np.linspace(0.0, 1.0, values.shape[0])
             target_positions = np.linspace(0.0, 1.0, output_count)
-            points = values.reshape(values.shape[0], -1, 4)
-            stretched = np.empty((output_count, points.shape[1], 4), dtype=np.float32)
             upper = np.searchsorted(source_positions, target_positions, side="right")
             upper = np.clip(upper, 1, values.shape[0] - 1)
             lower = upper - 1
@@ -82,14 +92,14 @@ class LandmarkAugmenter:
                 (target_positions - source_positions[lower])
                 / (source_positions[upper] - source_positions[lower])
             )
-            coordinates = points[:, :, :3].reshape(values.shape[0], -1)
-            stretched[:, :, :3] = (
-                coordinates[lower] * (1.0 - weight[:, None])
-                + coordinates[upper] * weight[:, None]
-            ).reshape(output_count, points.shape[1], 3)
-            nearest = np.rint(target_positions * (values.shape[0] - 1)).astype(int)
-            stretched[:, :, 3] = points[nearest, :, 3]
-            values = stretched.reshape(output_count, -1)
+            stretched = (
+                values[lower] * (1.0 - weight[:, None])
+                + values[upper] * weight[:, None]
+            ).astype(np.float32)
+            if values.shape[1] % 4 == 0:
+                nearest = np.rint(target_positions * (values.shape[0] - 1)).astype(int)
+                stretched[:, 3::4] = values[nearest, 3::4]
+            values = stretched
 
         drop_probability = float(self.config.get("frame_drop_probability", 0.0))
         if values.shape[0] > 2 and drop_probability > 0:

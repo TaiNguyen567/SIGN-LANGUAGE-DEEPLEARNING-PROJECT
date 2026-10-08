@@ -499,8 +499,15 @@ class RealtimeRecognizer:
             return
         sequence = np.stack(self.buffer).astype(np.float32, copy=False)
         if self.require_hand and self.feature_config.use_hands:
-            has_lh = (sequence[:, 3:84:4] > 0.5).any(axis=1)
-            has_rh = (sequence[:, 87:168:4] > 0.5).any(axis=1)
+            if sequence.shape[1] == 201:
+                has_lh = (sequence[:, 75:138] != 0.0).any(axis=1)
+                has_rh = (sequence[:, 138:201] != 0.0).any(axis=1)
+            elif sequence.shape[1] % 4 == 0:
+                has_lh = (sequence[:, 3:84:4] > 0.5).any(axis=1)
+                has_rh = (sequence[:, 87:168:4] > 0.5).any(axis=1)
+            else:
+                has_lh = np.ones(sequence.shape[0], dtype=bool)
+                has_rh = np.ones(sequence.shape[0], dtype=bool)
             hand_frames = int((has_lh | has_rh).sum())
             min_hand_frames = max(1, int(self.sequence_length * 0.2))
             if hand_frames < min_hand_frames:
@@ -513,16 +520,20 @@ class RealtimeRecognizer:
             log_probs = self.model(input_tensor, lengths)
         decoded = self.decoder.decode(log_probs, lengths)[0]
         best_ids = log_probs.detach().argmax(dim=-1).squeeze(1).tolist()
+        probs = log_probs.detach().float().exp().squeeze(1)
         non_blank = [int(idx) for idx in best_ids if idx != self.tokenizer.blank_id]
+        confidence = decoded.confidence
         if non_blank:
             dominant_id = Counter(non_blank).most_common(1)[0][0]
             raw_tokens = [self.tokenizer.tokens[dominant_id]]
+            dominant_conf = float(probs[:, dominant_id].max().item())
+            confidence = max(confidence, dominant_conf)
         elif decoded.token_ids:
             raw_tokens = [self.tokenizer.tokens[decoded.token_ids[-1]]]
         else:
             raw_tokens = []
-        filtered = confidence_filter(raw_tokens, decoded.confidence, self.confidence_threshold)
-        self._worker_confidence = decoded.confidence
+        filtered = confidence_filter(raw_tokens, confidence, self.confidence_threshold)
+        self._worker_confidence = confidence
         self.hypothesis_history.append(filtered)
         stable = temporal_smoothing(list(self.hypothesis_history), min_votes=3, window_size=5)
         if stable and (not self.pending_tokens or self.pending_tokens[-1] != stable[-1]):
@@ -530,17 +541,31 @@ class RealtimeRecognizer:
 
     def _update_motion(self, features: np.ndarray, current_time: float) -> None:
         if self.previous_features is not None:
-            previous = self.previous_features.reshape(-1, 4)
-            current = features.reshape(-1, 4)
-            visible = (previous[:, 3] > 0.5) & (current[:, 3] > 0.5)
-            if visible.any():
-                motion = float(np.linalg.norm(current[visible, :3] - previous[visible, :3], axis=1).mean())
-                if motion >= self.motion_threshold:
-                    self.last_motion_at = current_time
-                # Large motion spike → likely changing signs → reset smoothing
-                # so old predictions don't block the new sign from being accepted.
-                if motion >= self.motion_threshold * 4.0:
-                    self.hypothesis_history.clear()
+            if features.shape[0] % 4 == 0:
+                previous = self.previous_features.reshape(-1, 4)
+                current = features.reshape(-1, 4)
+                visible = (previous[:, 3] > 0.5) & (current[:, 3] > 0.5)
+                if visible.any():
+                    motion = float(np.linalg.norm(current[visible, :3] - previous[visible, :3], axis=1).mean())
+                else:
+                    motion = 0.0
+            elif features.shape[0] % 3 == 0:
+                previous = self.previous_features.reshape(-1, 3)
+                current = features.reshape(-1, 3)
+                visible = (previous != 0.0).any(axis=-1) & (current != 0.0).any(axis=-1)
+                if visible.any():
+                    motion = float(np.linalg.norm(current[visible] - previous[visible], axis=1).mean())
+                else:
+                    motion = 0.0
+            else:
+                motion = float(np.linalg.norm(features - self.previous_features))
+
+            if motion >= self.motion_threshold:
+                self.last_motion_at = current_time
+            # Large motion spike → likely changing signs → reset smoothing
+            # so old predictions don't block the new sign from being accepted.
+            if motion >= self.motion_threshold * 4.0:
+                self.hypothesis_history.clear()
         self.previous_features = features.copy()
 
     def _update_fps(self, now: float) -> float:

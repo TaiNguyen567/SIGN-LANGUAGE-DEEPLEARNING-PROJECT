@@ -33,5 +33,5 @@ def feature_config_from_dict(values: dict[str, Any]) -> FeatureConfig:
     settings = dict(values)
     if "face_landmark_indices" in settings:
         settings["face_landmark_indices"] = tuple(settings["face_landmark_indices"])
-    allowed = {"use_hands", "use_pose", "use_face", "face_landmark_indices", "min_visibility", "model_complexity"}
+    allowed = {"use_hands", "use_pose", "use_face", "face_landmark_indices", "min_visibility", "model_complexity", "layout"}
     return FeatureConfig(**{key: value for key, value in settings.items() if key in allowed})

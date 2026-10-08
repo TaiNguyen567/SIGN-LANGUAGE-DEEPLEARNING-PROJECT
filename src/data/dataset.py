@@ -41,9 +41,8 @@ class SignLanguageDataset(Dataset[dict[str, Any]]):
         if not self.metadata_path.is_file():
             raise FileNotFoundError(f"Metadata CSV not found: {self.metadata_path}")
         self.metadata = pd.read_csv(self.metadata_path, keep_default_na=False)
-        missing = [column for column in self.REQUIRED_COLUMNS if column not in self.metadata.columns]
-        if missing:
-            raise ValueError(f"Metadata is missing required columns: {', '.join(missing)}")
+        if "text" not in self.metadata.columns or not ({"video_path", "feature_path"}.intersection(self.metadata.columns)):
+            raise ValueError("Metadata must contain 'text' and at least one of 'video_path' or 'feature_path'")
         if self.metadata.empty:
             raise ValueError(f"Dataset metadata contains no samples: {self.metadata_path}")
         if (self.metadata["text"].astype(str).str.strip() == "").any():
@@ -69,14 +68,17 @@ class SignLanguageDataset(Dataset[dict[str, Any]]):
 
         text = str(row["text"])
         token_text = str(row.get("token_text", "")).strip() or text
-        target = self.tokenizer.encode(token_text)
+        if "label" in row and str(row["label"]).isdigit():
+            target = [int(row["label"]) + 2]
+        else:
+            target = self.tokenizer.encode(token_text)
         if not target:
             raise ValueError(f"Transcript tokenized to an empty sequence (row {index})")
         return {
             "features": torch.from_numpy(np.asarray(features, dtype=np.float32)),
             "target": torch.tensor(target, dtype=torch.long),
             "text": text,
-            "video_path": str(row["video_path"]),
+            "video_path": str(row.get("video_path", "")),
         }
 
     def close(self) -> None:
@@ -90,6 +92,9 @@ class SignLanguageDataset(Dataset[dict[str, Any]]):
             feature_path = self._resolve_path(feature_value)
             if not feature_path.is_file():
                 raise FileNotFoundError(f"Cached feature file not found: {feature_path}")
+            if feature_path.suffix == ".npz":
+                with np.load(feature_path, allow_pickle=False) as npz:
+                    return npz["sequence"].astype(np.float32, copy=False)
             return np.load(feature_path, allow_pickle=False).astype(np.float32, copy=False)
 
         video_path = self._resolve_path(str(row["video_path"]))

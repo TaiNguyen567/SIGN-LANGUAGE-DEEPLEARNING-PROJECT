@@ -57,6 +57,12 @@ class SignTokenizer:
         return cls((cls.BLANK_TOKEN, cls.UNKNOWN_TOKEN, *words))
 
     def encode(self, text: str) -> list[int]:
+        normalized = unicodedata.normalize("NFC", str(text)).strip()
+        if normalized in self.token_to_id:
+            return [self.token_to_id[normalized]]
+        upper = normalized.upper()
+        if upper in self.token_to_id:
+            return [self.token_to_id[upper]]
         return [self.token_to_id.get(token, self.unknown_id) for token in self.tokenize(text)]
 
     def decode(self, token_ids: Iterable[int], *, skip_blank: bool = True) -> str:

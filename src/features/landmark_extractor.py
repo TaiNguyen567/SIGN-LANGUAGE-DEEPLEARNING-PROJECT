@@ -26,9 +26,12 @@ class FeatureConfig:
     face_landmark_indices: tuple[int, ...] = field(default_factory=lambda: DEFAULT_FACE_INDICES)
     min_visibility: float = 0.5
     model_complexity: int = 1
+    layout: str = "holistic_v1"
 
     @property
     def feature_dim(self) -> int:
+        if self.layout == "vsl_201":
+            return 201
         point_count = 0
         if self.use_hands:
             point_count += 2 * 21
@@ -156,6 +159,33 @@ class LandmarkExtractor:
 
     def create_feature_vector(self, result: Any) -> np.ndarray:
         """Convert a MediaPipe Holistic result into the configured feature layout."""
+        if self.config.layout == "vsl_201":
+            pose_pts: list[float] = []
+            pose_res = getattr(result, "pose_landmarks", None)
+            if pose_res and hasattr(pose_res, "landmark"):
+                for lm in pose_res.landmark[:25]:
+                    pose_pts.extend((float(lm.x), float(lm.y), float(lm.z)))
+            else:
+                pose_pts = [0.0] * 75
+
+            lh_pts: list[float] = []
+            lh_res = getattr(result, "left_hand_landmarks", None)
+            if lh_res and hasattr(lh_res, "landmark"):
+                for lm in lh_res.landmark:
+                    lh_pts.extend((float(lm.x), float(lm.y), float(lm.z)))
+            else:
+                lh_pts = [0.0] * 63
+
+            rh_pts: list[float] = []
+            rh_res = getattr(result, "right_hand_landmarks", None)
+            if rh_res and hasattr(rh_res, "landmark"):
+                for lm in rh_res.landmark:
+                    rh_pts.extend((float(lm.x), float(lm.y), float(lm.z)))
+            else:
+                rh_pts = [0.0] * 63
+
+            return np.asarray(pose_pts + lh_pts + rh_pts, dtype=np.float32)
+
         groups: list[np.ndarray] = []
         if self.config.use_hands:
             groups.extend((

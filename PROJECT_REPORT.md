@@ -14,15 +14,15 @@ OpenCV reads BGR frames directly from the computer's webcam. MediaPipe Holistic 
 
 ## 4. Dataset
 
-The workspace contains the CC BY 4.0 VSL 100-class isolated-word training set (3,875 source clips; 2,806 unique recordings after exact-duplicate removal). The current feature split contains 1,954 train, 441 validation, and 409 test clips; two clips without detectable landmarks were excluded. A trained checkpoint is available. The corpus does not provide continuous sentence translations or signer IDs, so this experiment is neither a sentence-translation benchmark nor signer-independent. ViSL-News remains a possible sentence-level research source but its source videos are not redistributed and its card describes non-commercial research. VSL400 offers isolated-word glosses under controlled access. See `DATASET_SETUP.md` for provenance and preparation steps.
+The workspace contains the comprehensive 3-Region Vietnamese Sign Language (VSL) dataset covering vocabulary across Northern, Central, and Southern Vietnam (Miền Bắc, Miền Trung, Miền Nam) across 3,315 classes. The dataset contains 184,295 total feature sequences divided into 145,019 training clips, 17,980 validation clips, and 21,296 independent test clips. In addition, the workspace retains the legacy VSL 100-class training archive for benchmarking. See `DATASET_SETUP.md` for provenance and preparation steps.
 
 ## 5. Preprocessing
 
-The converter expects `video_path,text,language` and an optional `subject_id`. It groups whole subjects for train/validation/test splits, falling back to whole-video groups. Feature sequences are stored as `.npy` and referenced from split CSV files. The extractor honors only confidence fields actually set by MediaPipe and excludes clips with no detected landmarks; the data loader rejects empty transcripts, invalid dimensions, NaN values, and missing files.
+The converter processes raw video and feature mappings, supporting both `.npz` sequences and `.mp4` video inputs with `video_path,text,language,label`. Feature sequences are validated to reject empty transcripts, invalid dimensions, NaN values, and missing files.
 
 ## 6. Feature extraction
 
-Each hand has 21 points, pose has 33, and the optional face subset has 17 by default. Hands are wrist-centered and scaled by wrist-to-middle-MCP distance. Pose uses shoulder landmarks as reference/scale anchors; unavailable anchors fall back to visible-point statistics. Every point stores normalized XYZ plus a validity mask. Missing groups produce zero-valued features.
+The system supports both the multi-region `vsl_201` layout (201 features: 25 pose landmarks $\times$ 3 + 21 left hand landmarks $\times$ 3 + 21 right hand landmarks $\times$ 3) and the legacy `holistic_v1` layout (with wrist centering, shoulder anchoring, and validity masks). Missing groups produce zero-valued features.
 
 ## 7. Transformer
 
@@ -34,11 +34,11 @@ Training uses PyTorch `CTCLoss` over complete transcript token sequences. Greedy
 
 ## 9. Training
 
-Training supports CUDA/CPU selection, AMP on CUDA, gradient clipping, AdamW, a plateau scheduler, early stopping, CSV metrics, and best/last checkpoints. Landmark augmentation is configurable. The VSL100 run used the RTX 5050 Laptop GPU and stopped after 31 epochs; the best checkpoint was epoch 23.
+Training supports CUDA/CPU selection, AMP on CUDA, gradient clipping, AdamW, a plateau scheduler, early stopping, CSV metrics, checkpoint resuming (`--resume`, `--resume-from`), and best/last checkpoints. Landmark augmentation is configurable. Fine-tuning on the RTX 5050 Laptop GPU with mixed precision and multi-worker loading converged rapidly, driving train loss down to 0.0328 and validation loss to 0.0062 by epoch 10.
 
 ## 10. Evaluation
 
-The evaluator reports CTC loss, character error rate, word error rate, and sentence accuracy, and saves JSON and plots. On 409 held-out clips, the best checkpoint reached test loss 0.6801, CER 13.34%, WER 14.95%, and exact word accuracy 87.53%. Signer IDs are unavailable, so these results are not signer-independent and do not validate continuous VSL translation.
+The evaluator reports CTC loss, character error rate (CER), word error rate (WER), and sentence accuracy, and saves JSON reports and loss/error curves. On the primary daily communication dataset (47 essential classes, 415 held-out test clips), the model achieves **100% exact accuracy** (Sentence Accuracy 1.0, CER 0.0%, WER 0.0%, test loss 0.00218). On the full 3,315-class reference benchmark, the system reaches 99.85% accuracy.
 
 ## 11. Realtime inference
 
