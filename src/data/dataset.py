@@ -68,10 +68,9 @@ class SignLanguageDataset(Dataset[dict[str, Any]]):
 
         text = str(row["text"])
         token_text = str(row.get("token_text", "")).strip() or text
-        if "label" in row and str(row["label"]).isdigit():
+        target = self.tokenizer.encode(token_text)
+        if not target and "label" in row and str(row["label"]).isdigit():
             target = [int(row["label"]) + 2]
-        else:
-            target = self.tokenizer.encode(token_text)
         if not target:
             raise ValueError(f"Transcript tokenized to an empty sequence (row {index})")
         return {

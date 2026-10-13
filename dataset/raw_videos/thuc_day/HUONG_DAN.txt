@@ -1,0 +1,2 @@
+Bỏ các video quay cử chỉ 'thức dậy' (.mp4) vào thư mục này.
+Sau đó chạy script: python scripts/extract_new_class.py để tự động trích xuất đặc trưng sang dataset/Processed!

@@ -4,9 +4,9 @@ project:
   development_mode: true
 
 data:
-  train_metadata: dataset/metadata/train_basic.csv
-  val_metadata: dataset/metadata/val_basic.csv
-  test_metadata: dataset/metadata/test_basic.csv
+  train_metadata: dataset/metadata/train.csv
+  val_metadata: dataset/metadata/val.csv
+  test_metadata: dataset/metadata/test.csv
   sequence_length: 60
   stride: 8
   video_column: video_path
@@ -28,18 +28,18 @@ model:
   num_layers: 4
   dim_feedforward: 1024
   dropout: 0.1
-  num_classes: 49
+  num_classes: 4
   blank_id: 0
 
 training:
-  batch_size: 64
-  epochs: 20
+  batch_size: 16
+  epochs: 30
   learning_rate: 0.0003
   weight_decay: 0.0001
   gradient_clip_norm: 1.0
-  early_stopping_patience: 6
-  lr_scheduler_patience: 3
-  num_workers: 4
+  early_stopping_patience: 8
+  lr_scheduler_patience: 4
+  num_workers: 2
   mixed_precision: true
 
 augmentation:
@@ -61,11 +61,11 @@ realtime:
   sequence_length: 60
   process_every_n_frames: 1
   prediction_stride: 2
-  confidence_threshold: 0.45
+  confidence_threshold: 0.6
   silence_threshold: 0.8
   motion_threshold: 0.015
   show_landmarks: true
-  require_hand: false
+  require_hand: true
 
 translation:
   language: vi
@@ -83,4 +83,4 @@ paths:
   artifact_dir: artifacts
   log_dir: logs
   report_dir: reports
-  vocab_file: artifacts/vocab_basic.json
+  vocab_file: artifacts/vocab.json

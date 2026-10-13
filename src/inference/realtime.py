@@ -521,7 +521,7 @@ class RealtimeRecognizer:
         decoded = self.decoder.decode(log_probs, lengths)[0]
         best_ids = log_probs.detach().argmax(dim=-1).squeeze(1).tolist()
         probs = log_probs.detach().float().exp().squeeze(1)
-        non_blank = [int(idx) for idx in best_ids if idx != self.tokenizer.blank_id]
+        non_blank = [int(idx) for idx in best_ids if idx != self.tokenizer.blank_id and idx != self.tokenizer.unknown_id]
         confidence = decoded.confidence
         if non_blank:
             dominant_id = Counter(non_blank).most_common(1)[0][0]
@@ -529,7 +529,8 @@ class RealtimeRecognizer:
             dominant_conf = float(probs[:, dominant_id].max().item())
             confidence = max(confidence, dominant_conf)
         elif decoded.token_ids:
-            raw_tokens = [self.tokenizer.tokens[decoded.token_ids[-1]]]
+            meaningful_ids = [idx for idx in decoded.token_ids if idx != self.tokenizer.unknown_id]
+            raw_tokens = [self.tokenizer.tokens[meaningful_ids[-1]]] if meaningful_ids else []
         else:
             raw_tokens = []
         filtered = confidence_filter(raw_tokens, confidence, self.confidence_threshold)

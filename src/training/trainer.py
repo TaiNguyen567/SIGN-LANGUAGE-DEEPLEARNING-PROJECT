@@ -49,7 +49,7 @@ class Trainer:
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode="min", factor=0.5, patience=int(training.get("lr_scheduler_patience", 2)),
         )
-        self.criterion = CTCLoss(blank_id=tokenizer.blank_id)
+        self.criterion = CTCLoss(blank_id=tokenizer.blank_id, zero_infinity=True)
         self.decoder = CTCGreedyDecoder(blank_id=tokenizer.blank_id)
         self.amp_enabled = bool(training.get("mixed_precision", True) and device.type == "cuda")
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
@@ -157,7 +157,7 @@ class Trainer:
             with torch.set_grad_enabled(training):
                 with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                     log_probs = self.model(features, input_lengths)
-                loss = self.criterion(log_probs, targets, input_lengths, target_lengths)
+                loss = self.criterion(log_probs.float(), targets, input_lengths, target_lengths)
                 if training:
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)

@@ -9,7 +9,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 if "%~1"=="" (
-    echo [INFO] Dang mo camera voi Bo tu vung co ban (47 lop giao tiep - Do chinh xac 100%%)...
+    echo [INFO] Dang mo camera nhan dien 2 cu chi: XIN CHAO va THUC DAY...
     ".venv\Scripts\python.exe" app.py --device auto
 ) else (
     ".venv\Scripts\python.exe" app.py %*
