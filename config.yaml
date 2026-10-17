@@ -39,7 +39,7 @@ training:
   gradient_clip_norm: 1.0
   early_stopping_patience: 8
   lr_scheduler_patience: 4
-  num_workers: 2
+  num_workers: 0
   mixed_precision: true
 
 augmentation:
@@ -58,10 +58,10 @@ realtime:
   width: 1280
   height: 720
   fps: 30
-  sequence_length: 60
+  sequence_length: 30
   process_every_n_frames: 1
-  prediction_stride: 2
-  confidence_threshold: 0.6
+  prediction_stride: 1
+  confidence_threshold: 0.25
   silence_threshold: 0.8
   motion_threshold: 0.015
   show_landmarks: true

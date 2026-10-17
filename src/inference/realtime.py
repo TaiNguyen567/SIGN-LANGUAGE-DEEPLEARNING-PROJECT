@@ -563,10 +563,6 @@ class RealtimeRecognizer:
 
             if motion >= self.motion_threshold:
                 self.last_motion_at = current_time
-            # Large motion spike → likely changing signs → reset smoothing
-            # so old predictions don't block the new sign from being accepted.
-            if motion >= self.motion_threshold * 4.0:
-                self.hypothesis_history.clear()
         self.previous_features = features.copy()
 
     def _update_fps(self, now: float) -> float:

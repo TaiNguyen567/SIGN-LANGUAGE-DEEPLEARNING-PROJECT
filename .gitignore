@@ -40,7 +40,10 @@ features/*
 *.h5
 
 # Dataset files & Videos (Avoid large file uploads to GitHub)
+# GitHub rejects files over 100 MB. raw_videos holds ~1.6 GB of clips
+# plus an ~844 MB zip, so the whole folder stays local.
 dataset/raw/
+dataset/raw_videos/
 dataset/videos/
 dataset/train/*
 dataset/val/*
@@ -60,6 +63,9 @@ dataset/Dataset/
 *.gz
 *.rar
 *.7z
+*.pkl
+*.pickle
+*.npy
 
 # Reports & plots generated
 reports/*.json
