@@ -28,7 +28,7 @@ model:
   num_layers: 4
   dim_feedforward: 1024
   dropout: 0.1
-  num_classes: 4
+  num_classes: 20
   blank_id: 0
 
 training:
