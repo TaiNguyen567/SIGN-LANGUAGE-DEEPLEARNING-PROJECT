@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -50,6 +51,7 @@ class Trainer:
             self.optimizer, mode="min", factor=0.5, patience=int(training.get("lr_scheduler_patience", 2)),
         )
         self.criterion = CTCLoss(blank_id=tokenizer.blank_id, zero_infinity=True)
+        self.aux_weight = float(training.get("aux_ce_weight", 0.35))
         self.decoder = CTCGreedyDecoder(blank_id=tokenizer.blank_id)
         self.amp_enabled = bool(training.get("mixed_precision", True) and device.type == "cuda")
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
@@ -58,9 +60,37 @@ class Trainer:
         self.csv_path = self.log_dir / "training.csv"
 
     def resume_from_checkpoint(self, checkpoint_path: Path, override_lr: float | None = None) -> tuple[int, float]:
-        """Restore model, optimizer, and scheduler states from a saved checkpoint."""
+        """Restore model, optimizer, and scheduler states from a saved checkpoint (supports vocabulary expansion)."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
+        saved_state = checkpoint["model_state_dict"]
+        current_state = self.model.state_dict()
+        vocab_expanded = False
+
+        if (
+            "classifier.weight" in saved_state
+            and "classifier.weight" in current_state
+            and saved_state["classifier.weight"].shape != current_state["classifier.weight"].shape
+        ):
+            vocab_expanded = True
+            old_w = saved_state["classifier.weight"]
+            old_b = saved_state["classifier.bias"]
+            new_w = current_state["classifier.weight"].clone()
+            new_b = current_state["classifier.bias"].clone()
+            copy_rows = min(old_w.shape[0], new_w.shape[0])
+            new_w[:copy_rows] = old_w[:copy_rows]
+            new_b[:copy_rows] = old_b[:copy_rows]
+            saved_state = dict(saved_state)
+            saved_state["classifier.weight"] = new_w
+            saved_state["classifier.bias"] = new_b
+
+        self.model.load_state_dict(saved_state)
+        if vocab_expanded:
+            self.logger.info(
+                "Warm-started backbone and preserved %d existing classes from %s for expanded vocabulary (%d classes).",
+                copy_rows, checkpoint_path.name, self.model.num_classes,
+            )
+            return 1, float("inf")
+
         if "optimizer_state_dict" in checkpoint:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if override_lr is not None:
@@ -96,6 +126,7 @@ class Trainer:
             self.csv_path.unlink(missing_ok=True)
         history: list[dict[str, float]] = []
         best_val_loss = initial_best_val_loss
+        best_val_acc = -1.0
         best_epoch = start_epoch - 1 if initial_best_val_loss < float("inf") else 0
         stale_epochs = 0
         for epoch in range(start_epoch, epochs + 1):
@@ -124,20 +155,48 @@ class Trainer:
                 epoch, row["train_loss"], row["val_loss"], row["cer"], row["wer"], row["sentence_accuracy"] * 100.0, learning_rate,
             )
 
-            improved = val_result["loss"] < best_val_loss
-            if improved:
+            loss_improved = val_result["loss"] < best_val_loss
+            acc_improved = (
+                val_result["sentence_accuracy"] > best_val_acc
+                or (
+                    abs(val_result["sentence_accuracy"] - best_val_acc) < 1e-6
+                    and val_result["loss"] < best_val_loss
+                )
+            )
+            if loss_improved:
                 best_val_loss = val_result["loss"]
+            if acc_improved:
+                best_val_acc = val_result["sentence_accuracy"]
                 best_epoch = epoch
+            if loss_improved or acc_improved:
                 stale_epochs = 0
             else:
                 stale_epochs += 1
             self._save_checkpoint(self.checkpoint_dir / "last_model.pt", epoch, best_val_loss)
-            if improved:
+            if acc_improved:
                 self._save_checkpoint(self.checkpoint_dir / "best_model.pt", epoch, best_val_loss)
             if stale_epochs >= patience:
                 self.logger.info("early stopping at epoch %d; best epoch was %d", epoch, best_epoch)
                 break
         return history
+
+    def _compute_aux_loss(
+        self,
+        log_probs: torch.Tensor,
+        targets: torch.Tensor,
+        input_lengths: torch.Tensor,
+        target_lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.aux_weight <= 0.0 or not torch.all(target_lengths == 1):
+            return torch.zeros((), dtype=torch.float32, device=log_probs.device)
+        batch_size = log_probs.shape[1]
+        pooled_logits: list[torch.Tensor] = []
+        for b in range(batch_size):
+            length = max(1, int(input_lengths[b].item()))
+            seq_lp = log_probs[:length, b].float()
+            pooled_logits.append(torch.logsumexp(seq_lp, dim=0) - torch.log(torch.tensor(float(length), device=log_probs.device)))
+        stacked = torch.stack(pooled_logits, dim=0)
+        return F.cross_entropy(stacked, targets.to(log_probs.device, dtype=torch.long), label_smoothing=0.05)
 
     def _run_epoch(self, loader: DataLoader, *, training: bool) -> dict[str, float]:
         self.model.train(training)
@@ -157,18 +216,22 @@ class Trainer:
             with torch.set_grad_enabled(training):
                 with torch.amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
                     log_probs = self.model(features, input_lengths)
-                loss = self.criterion(log_probs.float(), targets, input_lengths, target_lengths)
+                ctc_loss = self.criterion(log_probs.float(), targets, input_lengths, target_lengths)
                 if training:
+                    aux_loss = self._compute_aux_loss(log_probs, targets, input_lengths, target_lengths)
+                    loss = (1.0 - self.aux_weight) * ctc_loss + self.aux_weight * aux_loss
                     self.scaler.scale(loss).backward()
                     self.scaler.unscale_(self.optimizer)
                     clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     if (step + 1) % 200 == 0 or (step + 1) == len(loader):
-                        self.logger.info("train step %d/%d (%.1f%%) batch_loss=%.4f", step + 1, len(loader), (step + 1) * 100.0 / len(loader), loss.item())
+                        self.logger.info("train step %d/%d (%.1f%%) batch_loss=%.4f", step + 1, len(loader), (step + 1) * 100.0 / len(loader), ctc_loss.item())
+                else:
+                    loss = ctc_loss
 
             batch_size = features.shape[0]
-            loss_total.add_(loss.detach().float() * batch_size)
+            loss_total.add_(ctc_loss.detach().float() * batch_size)
             sample_count += batch_size
             if not training:
                 decoded = self.decoder.decode(log_probs, input_lengths)

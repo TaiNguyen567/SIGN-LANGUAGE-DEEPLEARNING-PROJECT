@@ -8,7 +8,7 @@ import numpy as np
 
 
 class LandmarkAugmenter:
-    """Augment ``[T, F]`` arrays whose point layout is ``[x, y, z, valid]``."""
+    """Augment ``[T, F]`` arrays whose point layout is ``[x, y, z, valid]`` or ``[x, y, z]``."""
 
     def __init__(self, config: dict[str, Any], *, seed: int | None = None) -> None:
         self.config = dict(config)
@@ -35,6 +35,9 @@ class LandmarkAugmenter:
         else:
             raise ValueError(f"Unexpected landmark feature dimension: {values.shape[1]}")
 
+        center = coords[visible].mean(axis=0, keepdims=True) if visible.any() else np.zeros((1, 3), dtype=np.float32)
+        center = center.reshape(1, 1, 3)
+
         noise_std = float(self.config.get("gaussian_noise_std", 0.0))
         if noise_std > 0:
             coords += self.rng.normal(0.0, noise_std, size=coords.shape).astype(np.float32) * visible[:, :, None]
@@ -43,20 +46,25 @@ class LandmarkAugmenter:
         low, high = float(scale_range[0]), float(scale_range[1])
         if low <= 0 or high < low:
             raise ValueError("scale_range must contain positive ascending bounds")
-        coords *= float(self.rng.uniform(low, high))
+        scale = float(self.rng.uniform(low, high))
+        if visible.any():
+            coords[visible] = (coords[visible] - center.reshape(1, 3)) * scale + center.reshape(1, 3)
+
+        max_rotation = float(self.config.get("rotation_degrees", 0.0))
+        if max_rotation > 0 and visible.any():
+            angle = np.deg2rad(self.rng.uniform(-max_rotation, max_rotation))
+            cosine, sine = float(np.cos(angle)), float(np.sin(angle))
+            cx, cy = float(center[0, 0, 0]), float(center[0, 0, 1])
+            x_rel = coords[:, :, 0] - cx
+            y_rel = coords[:, :, 1] - cy
+            coords[:, :, 0] = (cosine * x_rel - sine * y_rel) + cx
+            coords[:, :, 1] = (sine * x_rel + cosine * y_rel) + cy
 
         translation_std = float(self.config.get("translation_std", 0.0))
         if translation_std > 0:
             shift = self.rng.normal(0.0, translation_std, size=(1, 1, 3)).astype(np.float32)
             coords += shift * visible[:, :, None]
 
-        max_rotation = float(self.config.get("rotation_degrees", 0.0))
-        if max_rotation > 0:
-            angle = np.deg2rad(self.rng.uniform(-max_rotation, max_rotation))
-            cosine, sine = np.cos(angle), np.sin(angle)
-            x_values, y_values = coords[:, :, 0].copy(), coords[:, :, 1].copy()
-            coords[:, :, 0] = cosine * x_values - sine * y_values
-            coords[:, :, 1] = sine * x_values + cosine * y_values
         mask_probability = float(self.config.get("landmark_mask_probability", 0.0))
         if has_valid_dim:
             if mask_probability > 0:

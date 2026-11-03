@@ -399,3 +399,107 @@ def test_open_camera_reports_windows_access_checks_when_all_backends_fail(monkey
 
     assert [backend for _, backend, _ in captures] == [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
     assert all(capture.released for _, _, capture in captures)
+
+
+def test_single_word_per_turn_overrides_transition_word_and_triggers_cooldown(recognizer_factory):
+    class _TransitionToMainModel:
+        def __init__(self):
+            self.calls = 0
+
+        def to(self, device):
+            return self
+
+        def eval(self):
+            return self
+
+        def __call__(self, features, lengths):
+            self.calls += 1
+            logits = torch.full((features.shape[1], 1, 4), -8.0, device=features.device)
+            # First 3 predictions emit token 2 ("ĂN"), subsequent 5 emit token 3 ("ĂN MỪNG") strongly
+            target_token = 2 if self.calls <= 3 else 3
+            logits[:, :, target_token] = 6.0 if self.calls <= 3 else 10.0
+            return logits.log_softmax(-1)
+
+    tokenizer = SignTokenizer(["<blank>", "<unk>", "ĂN", "ĂN MỪNG"])
+    config = {
+        "data": {"sequence_length": 4, "stride": 1},
+        "realtime": {
+            "show_landmarks": False,
+            "prediction_stride": 1,
+            "smoothing_window": 3,
+            "smoothing_votes": 2,
+            "confidence_threshold": 0.1,
+            "silence_threshold": 0.3,
+            "cooldown_seconds": 0.8,
+            "single_word_per_turn": True,
+            "motion_threshold": 0.01,
+        },
+    }
+    recognizer = recognizer_factory(
+        _TransitionToMainModel(), tokenizer, device=torch.device("cpu"),
+        feature_config=FeatureConfig(), config=config, extractor=_MovingExtractor(),
+    )
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+
+    # Initial transition frames recognize "ĂN"
+    for i in range(6):
+        _, state = _submit_and_wait(recognizer, frame, now=i * 0.05)
+    assert recognizer.pending_tokens == ["ĂN"]
+    assert state.gesture_elapsed > 0.0
+
+    # Main gesture frames override "ĂN" with "ĂN MỪNG" (single word, not "ĂN ĂN MỪNG")
+    for i in range(6, 10):
+        _, state = _submit_and_wait(recognizer, frame, now=i * 0.05)
+    assert recognizer.pending_tokens == ["ĂN MỪNG"]
+    assert state.sign_text == "ĂN MỪNG"
+
+    # Pause for silence_threshold -> commits "ĂN MỪNG" and activates 0.8s cooldown
+    _, state = _submit_and_wait(recognizer, frame, now=1.0)
+    completed = recognizer.drain_completed_events()
+    assert len(completed) == 1
+    assert completed[0][0] == "ĂN MỪNG"
+    assert state.cooldown_remaining == pytest.approx(0.8)
+
+
+def test_manual_confirm_holds_candidate_until_enter_and_supports_backspace(recognizer_factory, tmp_path):
+    transcript_path = tmp_path / "saved_transcript.txt"
+    tokenizer = SignTokenizer(["<blank>", "<unk>", "XIN LỖI", "CẢM ƠN"])
+    config = {
+        "data": {"sequence_length": 4, "stride": 1},
+        "realtime": {
+            "show_landmarks": False,
+            "prediction_stride": 1,
+            "smoothing_window": 3,
+            "smoothing_votes": 2,
+            "confidence_threshold": 0.1,
+            "silence_threshold": 0.2,
+            "manual_confirm": True,
+            "transcript_file": str(transcript_path),
+        },
+    }
+    recognizer = recognizer_factory(
+        _TokenModel(), tokenizer, device=torch.device("cpu"),
+        feature_config=FeatureConfig(), config=config, extractor=_MovingExtractor(),
+    )
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+
+    # Gesture is recognized as candidate ("XIN LỖI"), and even after silence it stays in pending_tokens
+    for i in range(8):
+        display, _ = _submit_and_wait(recognizer, frame, now=i * 0.1)
+    assert recognizer.pending_tokens == ["XIN LỖI"]
+    assert recognizer.committed_tokens == []
+    assert display.candidate_text == "XIN LỖI"
+
+    # User presses Enter -> confirm_current_sign() moves it to committed_tokens and writes transcript file
+    event = recognizer.confirm_current_sign()
+    assert event is not None
+    assert event[0] == "XIN LỖI"
+    assert event[1] == "Xin lỗi."
+    assert recognizer.pending_tokens == []
+    assert recognizer.committed_tokens == ["XIN LỖI"]
+    assert transcript_path.read_text(encoding="utf-8").strip() == "Xin lỗi."
+
+    # User presses Backspace -> pop_committed_sign() removes the last saved word
+    updated = recognizer.pop_committed_sign()
+    assert updated == ""
+    assert recognizer.committed_tokens == []

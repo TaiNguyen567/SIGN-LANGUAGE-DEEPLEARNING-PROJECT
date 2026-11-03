@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -25,6 +25,20 @@ from src.training.trainer import Trainer
 from src.utils.config import feature_config_from_dict, load_config, resolve_project_path
 from src.utils.device import format_device_info, get_device, get_device_info
 from src.utils.logger import configure_logger
+
+
+def _build_balanced_sampler(train_set: SignLanguageDataset, seed: int) -> WeightedRandomSampler:
+    labels = train_set.metadata["text"].astype(str)
+    counts = labels.value_counts().to_dict()
+    weights = [1.0 / (max(1, counts.get(label, 1)) ** 0.75) for label in labels]
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return WeightedRandomSampler(
+        weights=torch.as_tensor(weights, dtype=torch.double),
+        num_samples=len(weights),
+        replacement=True,
+        generator=generator,
+    )
 
 
 def main() -> int:
@@ -95,7 +109,12 @@ def main() -> int:
             "pin_memory": device.type == "cuda",
             "persistent_workers": workers > 0,
         }
-        train_loader = DataLoader(train_set, shuffle=True, **common_loader_args)
+        use_balanced = bool(training.get("balanced_sampling", True))
+        if use_balanced:
+            sampler = _build_balanced_sampler(train_set, seed=seed)
+            train_loader = DataLoader(train_set, sampler=sampler, **common_loader_args)
+        else:
+            train_loader = DataLoader(train_set, shuffle=True, **common_loader_args)
         val_loader = DataLoader(val_set, shuffle=False, **common_loader_args)
         log_dir = resolve_project_path(paths.get("log_dir", "logs"), project_root=ROOT)
         checkpoint_dir = resolve_project_path(paths.get("checkpoint_dir", "checkpoints"), project_root=ROOT)

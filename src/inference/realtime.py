@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections import Counter, deque
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty, Full, Queue
 from threading import Event, Lock, Thread
 from typing import Any
@@ -35,6 +36,11 @@ class RealtimeFrame:
     completed_translation: str = ""
     camera_fps: float = 0.0
     completed_events: tuple[tuple[str, str, float], ...] = ()
+    cooldown_remaining: float = 0.0
+    silence_remaining: float = 0.0
+    gesture_elapsed: float = 0.0
+    candidate_text: str = ""
+    committed_text: str = ""
     error: str = ""
 
 
@@ -57,6 +63,11 @@ class _InferenceResult:
     silent: bool
     completed_text: str = ""
     completed_translation: str = ""
+    cooldown_remaining: float = 0.0
+    silence_remaining: float = 0.0
+    gesture_elapsed: float = 0.0
+    candidate_text: str = ""
+    committed_text: str = ""
     error: str = ""
 
 
@@ -97,6 +108,12 @@ class RealtimeRecognizer:
         self.process_every_n_frames = max(1, int(realtime.get("process_every_n_frames", 1)))
         self.show_landmarks = bool(realtime.get("show_landmarks", True))
         self.require_hand = bool(realtime.get("require_hand", False))
+        self.smoothing_window = max(1, int(realtime.get("smoothing_window", 5)))
+        self.smoothing_votes = max(1, int(realtime.get("smoothing_votes", 3)))
+        self.cooldown_seconds = max(0.0, float(realtime.get("cooldown_seconds", 0.0)))
+        self.single_word_per_turn = bool(realtime.get("single_word_per_turn", True))
+        self.manual_confirm = bool(realtime.get("manual_confirm", False))
+        self.transcript_file = Path(realtime.get("transcript_file", "logs/saved_transcript.txt"))
         self.frame_queue: Queue[_FrameJob] = Queue(maxsize=1)
         self.result_queue: Queue[_InferenceResult] = Queue()
         self._control_queue: Queue[int] = Queue()
@@ -104,6 +121,7 @@ class RealtimeRecognizer:
         self._generation_lock = Lock()
         self._worker_lock = Lock()
         self._preview_lock = Lock()
+        self._state_lock = Lock()
         self._worker: Thread | None = None
         self._closed = False
         self._generation = 0
@@ -115,9 +133,12 @@ class RealtimeRecognizer:
         self.camera_fps = 0.0
         self.dropped_frames = 0
         self.buffer: deque[np.ndarray] = deque(maxlen=self.sequence_length)
-        self.hypothesis_history: deque[list[str]] = deque(maxlen=5)
+        self.hypothesis_history: deque[list[str]] = deque(maxlen=self.smoothing_window)
         self.committed_tokens: list[str] = []
         self.pending_tokens: list[str] = []
+        self._turn_scores: Counter[str] = Counter()
+        self._turn_started_at: float | None = None
+        self._cooldown_until: float = 0.0
         self._was_silent = False
         self.confidence = 0.0
         self._worker_confidence = 0.0
@@ -130,6 +151,51 @@ class RealtimeRecognizer:
         self._display_tokens: tuple[str, ...] | None = None
         self._display_sign_text = ""
         self._display_translated_text = ""
+
+    def confirm_current_sign(self) -> tuple[str, str, float] | None:
+        """Confirm the current candidate sign (on Enter/Space) and append it to the saved sentence."""
+        with self._state_lock:
+            if not self.pending_tokens:
+                return None
+            confirmed_word = self.decode_tokens(self.pending_tokens)
+            self.committed_tokens.extend(self.pending_tokens)
+            self.pending_tokens.clear()
+            self.hypothesis_history.clear()
+            self._turn_scores.clear()
+            self._turn_started_at = None
+            self.buffer.clear()
+            if self.cooldown_seconds > 0.0 and self.last_frame_at is not None:
+                self._cooldown_until = self.last_frame_at + self.cooldown_seconds
+            full_sentence = self.translator.translate(self.committed_tokens)
+            conf = self._worker_confidence
+            self._refresh_display_texts()
+            event = (confirmed_word, full_sentence, conf)
+            self._completed_events.append(event)
+            self._save_transcript_to_disk(full_sentence)
+            return event
+
+    def pop_committed_sign(self) -> str:
+        """Remove the most recently saved word (on Backspace) and return updated sentence."""
+        with self._state_lock:
+            if self.committed_tokens:
+                self.committed_tokens.pop()
+            self._refresh_display_texts()
+            full_sentence = self.translator.translate(self.committed_tokens) if self.committed_tokens else ""
+            self._save_transcript_to_disk(full_sentence)
+            return full_sentence
+
+    def _save_transcript_to_disk(self, sentence: str) -> None:
+        try:
+            self.transcript_file.parent.mkdir(parents=True, exist_ok=True)
+            self.transcript_file.write_text(sentence + ("\n" if sentence else ""), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _refresh_display_texts(self) -> None:
+        tokens = self.tokens
+        self._display_tokens = tuple(tokens)
+        self._display_sign_text = self.decode_tokens(tokens)
+        self._display_translated_text = self.translator.translate(tokens) if tokens else ""
 
     def process_frame(self, frame: np.ndarray, now: float | None = None) -> RealtimeFrame:
         """Enqueue a camera frame and return a display frame without waiting for AI."""
@@ -148,14 +214,34 @@ class RealtimeRecognizer:
             with self._preview_lock:
                 if self._landmark_preview is not None:
                     preview = self._landmark_preview.copy()
-        signs = latest.sign_text if latest else ""
-        translation = latest.translated_text if latest else ""
+        with self._state_lock:
+            candidate_text = self.decode_tokens(self.pending_tokens) if self.pending_tokens else ""
+            committed_text = self.decode_tokens(self.committed_tokens) if self.committed_tokens else ""
+            signs = self._display_sign_text if self._display_tokens is not None else (latest.sign_text if latest else "")
+            if self.manual_confirm:
+                translation = self.translator.translate(self.committed_tokens) if self.committed_tokens else ""
+            else:
+                translation = self._display_translated_text if self._display_tokens is not None else (latest.translated_text if latest else "")
         confidence = latest.confidence if latest else 0.0
         processing_fps = latest.fps if latest else 0.0
         latency_ms = latest.latency_ms if latest else 0.0
         silent = latest.silent if latest else False
+        cooldown_remaining = latest.cooldown_remaining if latest else 0.0
+        silence_remaining = latest.silence_remaining if latest else 0.0
+        gesture_elapsed = latest.gesture_elapsed if latest else 0.0
         self._draw_status(
-            preview, signs, translation, confidence, processing_fps, latency_ms, silent,
+            preview,
+            signs,
+            translation,
+            confidence,
+            processing_fps,
+            latency_ms,
+            silent,
+            cooldown_remaining=cooldown_remaining,
+            silence_remaining=silence_remaining,
+            gesture_elapsed=gesture_elapsed,
+            candidate_text=candidate_text,
+            committed_text=committed_text,
         )
         events = tuple(self._completed_events)
         self._completed_events.clear()
@@ -173,6 +259,11 @@ class RealtimeRecognizer:
             completed_translation=last_event[1],
             camera_fps=self.camera_fps,
             completed_events=events,
+            cooldown_remaining=cooldown_remaining,
+            silence_remaining=silence_remaining,
+            gesture_elapsed=gesture_elapsed,
+            candidate_text=candidate_text,
+            committed_text=committed_text,
             error=latest.error if latest else "",
         )
 
@@ -292,51 +383,110 @@ class RealtimeRecognizer:
             self._worker_generation = latest_generation
 
     def _process_ai_frame(self, job: _FrameJob) -> _InferenceResult:
-        self.frame_count += 1
-        should_process = self.previous_features is None or (self.frame_count - 1) % self.process_every_n_frames == 0
+        with self._state_lock:
+            self.frame_count += 1
+            should_process = self.previous_features is None or (self.frame_count - 1) % self.process_every_n_frames == 0
         features = self.extractor.extract(job.frame) if should_process else self.previous_features
         assert features is not None
-        self._update_motion(features, job.captured_at)
-        self.buffer.append(features)
-        silent = self.last_motion_at is not None and job.captured_at - self.last_motion_at >= self.silence_threshold
-
-        if len(self.buffer) == self.sequence_length and self.frame_count - self.last_model_frame >= self.stride:
-            self.last_model_frame = self.frame_count
-            self._predict_window(allow_prediction=not (silent and self._was_silent))
-
-        completed_text = ""
-        completed_translation = ""
-        if silent and not self._was_silent and self.pending_tokens:
-            completed_text = self.decode_tokens(self.pending_tokens)
-            completed_translation = self.translator.translate(self.pending_tokens)
-            self.committed_tokens.extend(self.pending_tokens)
-            self.pending_tokens.clear()
-            self.hypothesis_history.clear()
-        self._was_silent = silent
 
         if self.show_landmarks:
             annotated = self.extractor.draw_landmarks(job.frame.copy())
             with self._preview_lock:
                 self._landmark_preview = annotated
 
-        tokens = self.tokens
-        token_key = tuple(tokens)
-        if token_key != self._display_tokens:
-            self._display_tokens = token_key
-            self._display_sign_text = self.decode_tokens(tokens)
-            self._display_translated_text = self.translator.translate(tokens)
-        processing_fps = self._update_fps(job.captured_at)
-        return _InferenceResult(
-            generation=job.generation,
-            sign_text=self._display_sign_text,
-            translated_text=self._display_translated_text,
-            confidence=self._worker_confidence,
-            fps=processing_fps,
-            latency_ms=(time.perf_counter() - job.enqueued_at) * 1000.0,
-            silent=silent,
-            completed_text=completed_text,
-            completed_translation=completed_translation,
-        )
+        with self._state_lock:
+            cooldown_remaining = max(0.0, self._cooldown_until - job.captured_at)
+            if cooldown_remaining > 0.0:
+                self.previous_features = features.copy()
+                processing_fps = self._update_fps(job.captured_at)
+                return _InferenceResult(
+                    generation=job.generation,
+                    sign_text=self._display_sign_text,
+                    translated_text=self._display_translated_text,
+                    confidence=self._worker_confidence,
+                    fps=processing_fps,
+                    latency_ms=(time.perf_counter() - job.enqueued_at) * 1000.0,
+                    silent=True,
+                    cooldown_remaining=cooldown_remaining,
+                    silence_remaining=0.0,
+                    gesture_elapsed=0.0,
+                    candidate_text=self.decode_tokens(self.pending_tokens) if self.pending_tokens else "",
+                    committed_text=self.decode_tokens(self.committed_tokens) if self.committed_tokens else "",
+                )
+
+            self._update_motion(features, job.captured_at)
+            self.buffer.append(features)
+            silent = self.last_motion_at is not None and (job.captured_at - self.last_motion_at) >= self.silence_threshold
+
+            # In manual_confirm mode, if user was silent and starts moving hands again, start a fresh turn score
+            if self.manual_confirm and self._was_silent and not silent:
+                self._turn_scores.clear()
+                self._turn_started_at = job.captured_at
+            elif not silent and self.last_motion_at is not None and self._turn_started_at is None:
+                self._turn_started_at = job.captured_at
+
+            if len(self.buffer) == self.sequence_length and self.frame_count - self.last_model_frame >= self.stride:
+                self.last_model_frame = self.frame_count
+                self._predict_window(allow_prediction=not (silent and self._was_silent), now=job.captured_at)
+
+            completed_text = ""
+            completed_translation = ""
+            if not self.manual_confirm:
+                if silent and not self._was_silent and self.pending_tokens:
+                    completed_text = self.decode_tokens(self.pending_tokens)
+                    completed_translation = self.translator.translate(self.pending_tokens)
+                    self.committed_tokens.extend(self.pending_tokens)
+                    self.pending_tokens.clear()
+                    self.hypothesis_history.clear()
+                    self._turn_scores.clear()
+                    self._turn_started_at = None
+                    self.buffer.clear()
+                    if self.cooldown_seconds > 0.0:
+                        self._cooldown_until = job.captured_at + self.cooldown_seconds
+                        cooldown_remaining = self.cooldown_seconds
+                elif silent and not self.pending_tokens:
+                    self._turn_started_at = None
+                    self._turn_scores.clear()
+            else:
+                if silent and not self._was_silent:
+                    self._turn_started_at = None
+                    self._turn_scores.clear()
+
+            self._was_silent = silent
+
+            silence_remaining = 0.0
+            if not self.manual_confirm and self.pending_tokens and self.last_motion_at is not None and not silent:
+                silence_remaining = max(0.0, self.silence_threshold - (job.captured_at - self.last_motion_at))
+
+            gesture_elapsed = 0.0
+            if self._turn_started_at is not None and not silent:
+                gesture_elapsed = max(0.0, job.captured_at - self._turn_started_at)
+
+            tokens = self.tokens
+            token_key = tuple(tokens)
+            if token_key != self._display_tokens:
+                self._display_tokens = token_key
+                self._display_sign_text = self.decode_tokens(tokens)
+                self._display_translated_text = self.translator.translate(tokens)
+            processing_fps = self._update_fps(job.captured_at)
+            candidate_text = self.decode_tokens(self.pending_tokens) if self.pending_tokens else ""
+            committed_text = self.decode_tokens(self.committed_tokens) if self.committed_tokens else ""
+            return _InferenceResult(
+                generation=job.generation,
+                sign_text=self._display_sign_text,
+                translated_text=self._display_translated_text,
+                confidence=self._worker_confidence,
+                fps=processing_fps,
+                latency_ms=(time.perf_counter() - job.enqueued_at) * 1000.0,
+                silent=silent,
+                completed_text=completed_text,
+                completed_translation=completed_translation,
+                cooldown_remaining=cooldown_remaining,
+                silence_remaining=silence_remaining,
+                gesture_elapsed=gesture_elapsed,
+                candidate_text=candidate_text,
+                committed_text=committed_text,
+            )
 
     def _error_result(self, job: _FrameJob, exc: Exception) -> _InferenceResult:
         return _InferenceResult(
@@ -411,21 +561,25 @@ class RealtimeRecognizer:
             self._worker_generation = generation
 
     def _reset_worker_state(self) -> None:
-        self.buffer.clear()
-        self.hypothesis_history.clear()
-        self.committed_tokens.clear()
-        self.pending_tokens.clear()
-        self._was_silent = False
-        self._worker_confidence = 0.0
-        self.last_motion_at = None
-        self.previous_features = None
-        self.frame_count = 0
-        self.last_model_frame = 0
-        self.last_frame_at = None
-        self.fps = 0.0
-        self._display_tokens = None
-        self._display_sign_text = ""
-        self._display_translated_text = ""
+        with self._state_lock:
+            self.buffer.clear()
+            self.hypothesis_history.clear()
+            self.committed_tokens.clear()
+            self.pending_tokens.clear()
+            self._turn_scores.clear()
+            self._turn_started_at = None
+            self._cooldown_until = 0.0
+            self._was_silent = False
+            self._worker_confidence = 0.0
+            self.last_motion_at = None
+            self.previous_features = None
+            self.frame_count = 0
+            self.last_model_frame = 0
+            self.last_frame_at = None
+            self.fps = 0.0
+            self._display_tokens = None
+            self._display_sign_text = ""
+            self._display_translated_text = ""
 
     @property
     def tokens(self) -> list[str]:
@@ -470,9 +624,9 @@ class RealtimeRecognizer:
                     raise RuntimeError(result.error)
                 for gloss, sentence, confidence in result.completed_events:
                     latest_speech = sentence
-                    print(f"Sign: {gloss} | Vietnamese text: {sentence} | Confidence: {confidence:.1%}")
-                    if speaker is not None and sentence:
-                        speaker.speak(sentence)
+                    print(f"[ĐÃ LƯU] Từ: {gloss} | Văn bản hiện tại: {sentence} | Tin cậy: {confidence:.1%}")
+                    if speaker is not None and gloss:
+                        speaker.speak(gloss)
                 if speaker is not None and speaker.error and speaker.error != speech_error_reported:
                     print(speaker.error)
                     speech_error_reported = speaker.error
@@ -480,12 +634,33 @@ class RealtimeRecognizer:
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
                     break
-                if key == ord("r"):
+                if key in (13, 10, ord(" ")):
+                    confirmed = self.confirm_current_sign()
+                    if confirmed is not None:
+                        word, full_sentence, conf = confirmed
+                        latest_speech = full_sentence
+                        print(f"[ENTER - ĐÃ LƯU] +{word} => Câu văn: {full_sentence} (Tin cậy: {conf:.1%})")
+                        if speaker is not None and word:
+                            speaker.speak(word)
+                elif key == 8:
+                    updated_sentence = self.pop_committed_sign()
+                    latest_speech = updated_sentence
+                    print(f"[BACKSPACE - XÓA 1 TỪ] Câu văn hiện tại: {updated_sentence or '(trống)'}")
+                elif key == ord("r"):
                     self.reset()
+                    print("[RESET] Đã xóa toàn bộ văn bản.")
                 elif key == ord("l"):
                     self.show_landmarks = not self.show_landmarks
-                elif key == ord("s") and speaker is not None and latest_speech:
-                    speaker.speak(latest_speech)
+                elif key == ord("s") and speaker is not None:
+                    with self._state_lock:
+                        sentence_to_speak = (
+                            self.translator.translate(self.committed_tokens)
+                            if self.committed_tokens
+                            else (self.translator.translate(self.pending_tokens) if self.pending_tokens else latest_speech)
+                        )
+                    if sentence_to_speak:
+                        print(f"[ĐỌC CÂU VĂN]: {sentence_to_speak}")
+                        speaker.speak(sentence_to_speak)
         finally:
             if capture is not None:
                 capture.release()
@@ -494,7 +669,7 @@ class RealtimeRecognizer:
                 speaker.close()
             self.close()
 
-    def _predict_window(self, *, allow_prediction: bool = True) -> None:
+    def _predict_window(self, *, allow_prediction: bool = True, now: float | None = None) -> None:
         if not allow_prediction:
             return
         sequence = np.stack(self.buffer).astype(np.float32, copy=False)
@@ -508,8 +683,9 @@ class RealtimeRecognizer:
             else:
                 has_lh = np.ones(sequence.shape[0], dtype=bool)
                 has_rh = np.ones(sequence.shape[0], dtype=bool)
-            hand_frames = int((has_lh | has_rh).sum())
-            min_hand_frames = max(1, int(self.sequence_length * 0.2))
+            hand_mask = has_lh | has_rh
+            hand_frames = int(hand_mask.sum())
+            min_hand_frames = max(1, int(self.sequence_length * 0.25))
             if hand_frames < min_hand_frames:
                 self._worker_confidence = 0.0
                 self.hypothesis_history.clear()
@@ -524,21 +700,50 @@ class RealtimeRecognizer:
         non_blank = [int(idx) for idx in best_ids if idx != self.tokenizer.blank_id and idx != self.tokenizer.unknown_id]
         confidence = decoded.confidence
         if non_blank:
-            dominant_id = Counter(non_blank).most_common(1)[0][0]
+            counts = Counter(non_blank)
+            dominant_id = max(
+                counts,
+                key=lambda cid: (counts[cid], float(probs[:, cid].mean().item())),
+            )
             raw_tokens = [self.tokenizer.tokens[dominant_id]]
-            dominant_conf = float(probs[:, dominant_id].max().item())
-            confidence = max(confidence, dominant_conf)
+            peak_conf = float(probs[:, dominant_id].max().item())
+            top_k = max(1, min(5, probs.shape[0]))
+            topk_conf = float(torch.topk(probs[:, dominant_id], k=top_k).values.mean().item())
+            confidence = max(confidence, 0.6 * peak_conf + 0.4 * topk_conf)
         elif decoded.token_ids:
             meaningful_ids = [idx for idx in decoded.token_ids if idx != self.tokenizer.unknown_id]
-            raw_tokens = [self.tokenizer.tokens[meaningful_ids[-1]]] if meaningful_ids else []
+            if meaningful_ids:
+                dominant_id = meaningful_ids[-1]
+                raw_tokens = [self.tokenizer.tokens[dominant_id]]
+                top_k = max(1, min(5, probs.shape[0]))
+                topk_conf = float(torch.topk(probs[:, dominant_id], k=top_k).values.mean().item())
+                peak_conf = float(probs[:, dominant_id].max().item())
+                confidence = max(confidence, 0.5 * peak_conf + 0.5 * topk_conf)
+            else:
+                raw_tokens = []
         else:
             raw_tokens = []
         filtered = confidence_filter(raw_tokens, confidence, self.confidence_threshold)
         self._worker_confidence = confidence
         self.hypothesis_history.append(filtered)
-        stable = temporal_smoothing(list(self.hypothesis_history), min_votes=3, window_size=5)
-        if stable and (not self.pending_tokens or self.pending_tokens[-1] != stable[-1]):
-            self.pending_tokens.append(stable[-1])
+        stable = temporal_smoothing(
+            list(self.hypothesis_history),
+            min_votes=self.smoothing_votes,
+            window_size=self.smoothing_window,
+        )
+        if stable:
+            candidate = stable[-1]
+            if self._turn_started_at is None and now is not None:
+                self._turn_started_at = now
+            if self.single_word_per_turn:
+                for existing_tok in list(self._turn_scores):
+                    self._turn_scores[existing_tok] *= 0.85
+                self._turn_scores[candidate] += confidence
+                best_turn_token = max(self._turn_scores, key=lambda tok: self._turn_scores[tok])
+                self.pending_tokens = [best_turn_token]
+            else:
+                if not self.pending_tokens or self.pending_tokens[-1] != candidate:
+                    self.pending_tokens.append(candidate)
 
     def _update_motion(self, features: np.ndarray, current_time: float) -> None:
         if self.previous_features is not None:
@@ -583,6 +788,33 @@ class RealtimeRecognizer:
         self._last_capture_at = now
         return self.camera_fps
 
+    def _format_timer_status(
+        self,
+        *,
+        silent: bool,
+        cooldown_remaining: float,
+        silence_remaining: float,
+        gesture_elapsed: float,
+        candidate_text: str = "",
+    ) -> str:
+        if cooldown_remaining > 0.0:
+            return f"Đã lưu từ! Nghỉ hạ tay: còn {cooldown_remaining:.1f}s"
+        if self.manual_confirm:
+            if candidate_text:
+                if not silent and gesture_elapsed > 0.0:
+                    return f"Đang làm động tác ({gesture_elapsed:.1f}s) -> Nhấn ENTER để lưu '{candidate_text}'"
+                return f"Đã bắt được từ '{candidate_text}' -> Nhấn ENTER để lưu (hoặc làm lại để đổi)"
+            if gesture_elapsed > 0.0 and not silent:
+                return f"Đang phân tích động tác: {gesture_elapsed:.1f}s..."
+            return "Sẵn sàng (0.0s) - Hãy làm 1 động tác rồi nhấn ENTER để lưu vào câu"
+        if self.pending_tokens and silence_remaining > 0.0:
+            return f"Thời gian lượt: {gesture_elapsed:.1f}s  |  Giữ yên/hạ tay để chốt: còn {silence_remaining:.1f}s"
+        if gesture_elapsed > 0.0 and not silent:
+            return f"Đang thực hiện động tác: {gesture_elapsed:.1f}s  (Dừng tay {self.silence_threshold:.1f}s để chốt)"
+        if silent:
+            return "Đã kết thúc lượt (0.0s)  |  Sẵn sàng nhận ký hiệu tiếp theo"
+        return f"Sẵn sàng (0.0s)  |  Mỗi lượt giữ/dừng tay {self.silence_threshold:.1f}s để chốt từ"
+
     def _draw_status(
         self,
         frame: np.ndarray,
@@ -592,17 +824,41 @@ class RealtimeRecognizer:
         processing_fps: float,
         latency_ms: float,
         silent: bool,
+        *,
+        cooldown_remaining: float = 0.0,
+        silence_remaining: float = 0.0,
+        gesture_elapsed: float = 0.0,
+        candidate_text: str = "",
+        committed_text: str = "",
     ) -> None:
-        rows = [
-            "Hỗ trợ giao tiếp bằng ngôn ngữ ký hiệu",
-            f"Ký hiệu nhận diện: {signs or '...'}",
-            f"Câu tiếng Việt (thử nghiệm): {translation or '...'}",
-            f"Tin cậy: {confidence:.1%}  AI: {processing_fps:.1f} FPS  Camera: {self.camera_fps:.1f} FPS  Trễ: {latency_ms:.1f} ms",
-            f"Thiết bị: {self.device_label}" + ("  Đã kết thúc lượt ký hiệu" if silent else ""),
-            "R: Xóa   L: Khung xương   S: Đọc lại   Q/Esc: Thoát"
-            if self.config.get("tts", {}).get("enabled", False)
-            else "R: Xóa   L: Khung xương   Q/Esc: Thoát",
-        ]
+        timer_line = self._format_timer_status(
+            silent=silent,
+            cooldown_remaining=cooldown_remaining,
+            silence_remaining=silence_remaining,
+            gesture_elapsed=gesture_elapsed,
+            candidate_text=candidate_text,
+        )
+        if self.manual_confirm:
+            rows = [
+                "Hỗ trợ giao tiếp bằng ngôn ngữ ký hiệu (Chế độ nhấn ENTER để lưu)",
+                f"Từ đang nhận diện (1 từ): {candidate_text or '...'}",
+                f"Văn bản đã lưu: {translation or committed_text or '(Chưa có - Nhấn Enter khi thấy từ đúng)'}",
+                f"Hướng dẫn & Nhịp: {timer_line}",
+                f"Tin cậy: {confidence:.1%}  AI: {processing_fps:.1f} FPS  Camera: {self.camera_fps:.1f} FPS  Trễ: {latency_ms:.1f} ms",
+                "Enter/Space: Lưu từ   Backspace: Xóa 1 từ   R: Xóa hết   S: Đọc câu   L: Khung xương   Q: Thoát",
+            ]
+        else:
+            rows = [
+                "Hỗ trợ giao tiếp bằng ngôn ngữ ký hiệu",
+                f"Ký hiệu nhận diện: {signs or '...'}",
+                f"Câu tiếng Việt (thử nghiệm): {translation or '...'}",
+                f"Bộ đếm nhịp: {timer_line}",
+                f"Tin cậy: {confidence:.1%}  AI: {processing_fps:.1f} FPS  Camera: {self.camera_fps:.1f} FPS  Trễ: {latency_ms:.1f} ms",
+                f"Thiết bị: {self.device_label}" + ("  Đã kết thúc lượt ký hiệu" if silent else ""),
+                "R: Xóa   L: Khung xương   S: Đọc lại   Q/Esc: Thoát"
+                if self.config.get("tts", {}).get("enabled", False)
+                else "R: Xóa   L: Khung xương   Q/Esc: Thoát",
+            ]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb).convert("RGBA")
         try:
@@ -612,29 +868,37 @@ class RealtimeRecognizer:
         padding = 12
         max_width = max(1, image.width - padding * 2)
         draw_probe = ImageDraw.Draw(image)
-        lines: list[str] = []
-        for row in rows:
+        lines: list[tuple[str, tuple[int, int, int, int]]] = []
+        for row_idx, row in enumerate(rows):
+            if self.manual_confirm and row_idx == 1 and candidate_text:
+                color = (255, 230, 80, 255)  # Yellow highlight for active candidate word
+            elif self.manual_confirm and row_idx == 2 and (translation or committed_text):
+                color = (100, 255, 160, 255)  # Green highlight for saved sentence
+            elif row_idx == 3:
+                color = (130, 235, 255, 255)  # Cyan for timer/guide line
+            else:
+                color = (255, 255, 255, 255)
             words = row.split()
             current = ""
             for word in words:
                 candidate = f"{current} {word}".strip()
                 if current and draw_probe.textbbox((0, 0), candidate, font=font)[2] > max_width:
-                    lines.append(current)
+                    lines.append((current, color))
                     current = word
                 else:
                     current = candidate
             if current:
-                lines.append(current)
+                lines.append((current, color))
         line_height = 25
         panel_height = min(image.height, padding * 2 + line_height * len(lines))
         overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
-        overlay_draw.rectangle((0, 0, image.width, panel_height), fill=(0, 0, 0, 185))
+        overlay_draw.rectangle((0, 0, image.width, panel_height), fill=(0, 0, 0, 190))
         image = Image.alpha_composite(image, overlay)
         draw = ImageDraw.Draw(image)
-        for index, text in enumerate(lines):
+        for index, (text, fill_color) in enumerate(lines):
             y = padding + index * line_height
             if y + line_height > image.height:
                 break
-            draw.text((padding, y), text, font=font, fill=(255, 255, 255, 255))
+            draw.text((padding, y), text, font=font, fill=fill_color)
         frame[:] = cv2.cvtColor(np.asarray(image.convert("RGB")), cv2.COLOR_RGB2BGR)

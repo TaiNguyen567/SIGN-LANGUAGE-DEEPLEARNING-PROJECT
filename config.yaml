@@ -7,8 +7,8 @@ data:
   train_metadata: dataset/metadata/train.csv
   val_metadata: dataset/metadata/val.csv
   test_metadata: dataset/metadata/test.csv
-  sequence_length: 60
-  stride: 8
+  sequence_length: 30
+  stride: 4
   video_column: video_path
   text_column: text
   language_column: language
@@ -28,7 +28,7 @@ model:
   num_layers: 4
   dim_feedforward: 1024
   dropout: 0.1
-  num_classes: 20
+  num_classes: 30
   blank_id: 0
 
 training:
@@ -41,15 +41,17 @@ training:
   lr_scheduler_patience: 4
   num_workers: 0
   mixed_precision: true
+  balanced_sampling: true
+  aux_ce_weight: 0.35
 
 augmentation:
   enabled: true
-  gaussian_noise_std: 0.01
-  scale_range: [0.95, 1.05]
-  translation_std: 0.01
-  rotation_degrees: 5.0
-  temporal_crop_probability: 0.2
-  temporal_stretch_probability: 0.2
+  gaussian_noise_std: 0.008
+  scale_range: [0.92, 1.08]
+  translation_std: 0.015
+  rotation_degrees: 6.0
+  temporal_crop_probability: 0.25
+  temporal_stretch_probability: 0.25
   frame_drop_probability: 0.05
   landmark_mask_probability: 0.02
 
@@ -60,10 +62,16 @@ realtime:
   fps: 30
   sequence_length: 30
   process_every_n_frames: 1
-  prediction_stride: 1
-  confidence_threshold: 0.25
-  silence_threshold: 0.8
-  motion_threshold: 0.015
+  prediction_stride: 2
+  smoothing_window: 5
+  smoothing_votes: 3
+  confidence_threshold: 0.45
+  silence_threshold: 0.7
+  cooldown_seconds: 0.8
+  single_word_per_turn: true
+  manual_confirm: true
+  transcript_file: logs/saved_transcript.txt
+  motion_threshold: 0.012
   show_landmarks: true
   require_hand: true
 

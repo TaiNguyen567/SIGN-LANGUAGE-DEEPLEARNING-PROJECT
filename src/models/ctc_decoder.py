@@ -57,20 +57,43 @@ class CTCGreedyDecoder:
         for batch_index, limit in enumerate(limits):
             token_ids: list[int] = []
             token_confidences: list[float] = []
+            token_counts: list[int] = []
             previous = self.blank_id
             for frame_id, frame_confidence in packed_path[batch_index][:limit]:
                 current = int(frame_id)
-                if current != self.blank_id and current != previous:
-                    token_ids.append(current)
-                    token_confidences.append(float(frame_confidence))
+                conf = float(frame_confidence)
+                if current != self.blank_id:
+                    if current != previous:
+                        token_ids.append(current)
+                        token_confidences.append(conf)
+                        token_counts.append(1)
+                    elif token_confidences:
+                        token_confidences[-1] = max(token_confidences[-1], conf)
+                        token_counts[-1] += 1
                 previous = current
 
+            if len(token_ids) > 1:
+                max_conf = max(token_confidences)
+                max_count = max(token_counts)
+                filtered_pairs = [
+                    (tid, tconf)
+                    for tid, tconf, tcnt in zip(token_ids, token_confidences, token_counts)
+                    if not (tcnt == 1 and max_count >= 2 and tconf < 0.75 and tconf < max_conf * 0.8)
+                ]
+                if filtered_pairs:
+                    token_ids = [p[0] for p in filtered_pairs]
+                    token_confidences = [p[1] for p in filtered_pairs]
+
             if not token_ids and self.fallback_non_blank and limit > 0 and classes > 1:
-                seq_lp = log_probs[:limit, batch_index].detach().clone()
-                seq_lp[:, self.blank_id] = -float("inf")
-                max_val, max_idx = torch.max(seq_lp.reshape(-1), dim=0)
-                best_token = (max_idx % classes).item()
-                best_conf = float(torch.exp(max_val).item())
+                seq_probs = probabilities[:limit, batch_index].detach().clone()
+                seq_probs[:, self.blank_id] = 0.0
+                if classes > 2:
+                    seq_probs[:, 1] = 0.0
+                top_k = min(5, limit)
+                topk_vals, _ = torch.topk(seq_probs, k=top_k, dim=0)
+                mean_topk = topk_vals.mean(dim=0)
+                best_token = int(torch.argmax(mean_topk).item())
+                best_conf = float(seq_probs[:, best_token].max().item())
                 if best_conf >= self.min_fallback_confidence:
                     token_ids.append(best_token)
                     token_confidences.append(best_conf)
