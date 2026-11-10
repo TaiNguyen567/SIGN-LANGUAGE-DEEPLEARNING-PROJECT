@@ -72,17 +72,13 @@ class CTCGreedyDecoder:
                         token_counts[-1] += 1
                 previous = current
 
-            if len(token_ids) > 1:
-                max_conf = max(token_confidences)
-                max_count = max(token_counts)
-                filtered_pairs = [
-                    (tid, tconf)
-                    for tid, tconf, tcnt in zip(token_ids, token_confidences, token_counts)
-                    if not (tcnt == 1 and max_count >= 2 and tconf < 0.75 and tconf < max_conf * 0.8)
-                ]
-                if filtered_pairs:
-                    token_ids = [p[0] for p in filtered_pairs]
-                    token_confidences = [p[1] for p in filtered_pairs]
+            if len(token_ids) > 1 and limit >= 15:
+                seq_probs = probabilities[:limit, batch_index].detach()
+                mass = {tid: float(seq_probs[:, tid].sum().item()) for tid in set(token_ids)}
+                best_tid = max(mass, key=lambda t: mass[t])
+                best_conf = float(seq_probs[:, best_tid].max().item())
+                token_ids = [best_tid]
+                token_confidences = [best_conf]
 
             if not token_ids and self.fallback_non_blank and limit > 0 and classes > 1:
                 seq_probs = probabilities[:limit, batch_index].detach().clone()

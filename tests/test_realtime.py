@@ -503,3 +503,41 @@ def test_manual_confirm_holds_candidate_until_enter_and_supports_backspace(recog
     updated = recognizer.pop_committed_sign()
     assert updated == ""
     assert recognizer.committed_tokens == []
+
+
+def test_auto_commit_prints_each_step_without_enter(recognizer_factory, tmp_path):
+    transcript_path = tmp_path / "saved_transcript.txt"
+    tokenizer = SignTokenizer(["<blank>", "<unk>", "XIN LỖI", "CẢM ƠN"])
+    config = {
+        "data": {"sequence_length": 4, "stride": 1},
+        "realtime": {
+            "show_landmarks": False,
+            "prediction_stride": 1,
+            "smoothing_window": 3,
+            "smoothing_votes": 2,
+            "confidence_threshold": 0.1,
+            "silence_threshold": 5.0,
+            "auto_commit_seconds": 0.2,
+            "cooldown_seconds": 0.0,
+            "manual_confirm": False,
+            "transcript_file": str(transcript_path),
+        },
+    }
+    recognizer = recognizer_factory(
+        _TokenModel(), tokenizer, device=torch.device("cpu"),
+        feature_config=FeatureConfig(), config=config, extractor=_MovingExtractor(),
+    )
+    frame = np.zeros((48, 64, 3), dtype=np.uint8)
+
+    events = []
+    for i in range(8):
+        display, _ = _submit_and_wait(recognizer, frame, now=i * 0.1)
+        events.extend(display.completed_events)
+    events.extend(recognizer.drain_completed_events())
+
+    assert len(events) >= 1
+    assert events[0][0] == "XIN LỖI"
+    assert events[0][1] == "Xin lỗi."
+    assert "XIN LỖI" in recognizer.committed_tokens
+    assert transcript_path.read_text(encoding="utf-8").strip().startswith("Xin lỗi")
+

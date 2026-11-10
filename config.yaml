@@ -66,10 +66,11 @@ realtime:
   smoothing_window: 5
   smoothing_votes: 3
   confidence_threshold: 0.45
-  silence_threshold: 0.7
-  cooldown_seconds: 0.8
+  silence_threshold: 0.45
+  auto_commit_seconds: 0.6
+  cooldown_seconds: 0.6
   single_word_per_turn: true
-  manual_confirm: true
+  manual_confirm: false
   transcript_file: logs/saved_transcript.txt
   motion_threshold: 0.012
   show_landmarks: true

@@ -110,6 +110,7 @@ class RealtimeRecognizer:
         self.require_hand = bool(realtime.get("require_hand", False))
         self.smoothing_window = max(1, int(realtime.get("smoothing_window", 5)))
         self.smoothing_votes = max(1, int(realtime.get("smoothing_votes", 3)))
+        self.auto_commit_seconds = max(0.0, float(realtime.get("auto_commit_seconds", 0.0)))
         self.cooldown_seconds = max(0.0, float(realtime.get("cooldown_seconds", 0.0)))
         self.single_word_per_turn = bool(realtime.get("single_word_per_turn", True))
         self.manual_confirm = bool(realtime.get("manual_confirm", False))
@@ -138,6 +139,8 @@ class RealtimeRecognizer:
         self.pending_tokens: list[str] = []
         self._turn_scores: Counter[str] = Counter()
         self._turn_started_at: float | None = None
+        self._candidate_started_at: float | None = None
+        self._missing_hand_frames = 0
         self._cooldown_until: float = 0.0
         self._was_silent = False
         self.confidence = 0.0
@@ -163,6 +166,8 @@ class RealtimeRecognizer:
             self.hypothesis_history.clear()
             self._turn_scores.clear()
             self._turn_started_at = None
+            self._candidate_started_at = None
+            self._missing_hand_frames = 0
             self.buffer.clear()
             if self.cooldown_seconds > 0.0 and self.last_frame_at is not None:
                 self._cooldown_until = self.last_frame_at + self.cooldown_seconds
@@ -398,6 +403,7 @@ class RealtimeRecognizer:
             cooldown_remaining = max(0.0, self._cooldown_until - job.captured_at)
             if cooldown_remaining > 0.0:
                 self.previous_features = features.copy()
+                self.buffer.append(features)
                 processing_fps = self._update_fps(job.captured_at)
                 return _InferenceResult(
                     generation=job.generation,
@@ -414,6 +420,11 @@ class RealtimeRecognizer:
                     committed_text=self.decode_tokens(self.committed_tokens) if self.committed_tokens else "",
                 )
 
+            if self._frame_has_hand(features):
+                self._missing_hand_frames = 0
+            else:
+                self._missing_hand_frames += 1
+
             self._update_motion(features, job.captured_at)
             self.buffer.append(features)
             silent = self.last_motion_at is not None and (job.captured_at - self.last_motion_at) >= self.silence_threshold
@@ -422,6 +433,7 @@ class RealtimeRecognizer:
             if self.manual_confirm and self._was_silent and not silent:
                 self._turn_scores.clear()
                 self._turn_started_at = job.captured_at
+                self._candidate_started_at = None
             elif not silent and self.last_motion_at is not None and self._turn_started_at is None:
                 self._turn_started_at = job.captured_at
 
@@ -432,31 +444,45 @@ class RealtimeRecognizer:
             completed_text = ""
             completed_translation = ""
             if not self.manual_confirm:
-                if silent and not self._was_silent and self.pending_tokens:
+                hand_dropped = self.require_hand and self._missing_hand_frames >= 3
+                auto_commit_ready = (
+                    self.auto_commit_seconds > 0.0
+                    and self._candidate_started_at is not None
+                    and (job.captured_at - self._candidate_started_at) >= self.auto_commit_seconds
+                )
+                if self.pending_tokens and (silent or hand_dropped or auto_commit_ready):
                     completed_text = self.decode_tokens(self.pending_tokens)
-                    completed_translation = self.translator.translate(self.pending_tokens)
                     self.committed_tokens.extend(self.pending_tokens)
+                    completed_translation = self.translator.translate(self.committed_tokens)
                     self.pending_tokens.clear()
                     self.hypothesis_history.clear()
                     self._turn_scores.clear()
                     self._turn_started_at = None
+                    self._candidate_started_at = None
+                    self._missing_hand_frames = 0
                     self.buffer.clear()
+                    self._save_transcript_to_disk(completed_translation)
                     if self.cooldown_seconds > 0.0:
                         self._cooldown_until = job.captured_at + self.cooldown_seconds
                         cooldown_remaining = self.cooldown_seconds
                 elif silent and not self.pending_tokens:
                     self._turn_started_at = None
+                    self._candidate_started_at = None
                     self._turn_scores.clear()
             else:
                 if silent and not self._was_silent:
                     self._turn_started_at = None
+                    self._candidate_started_at = None
                     self._turn_scores.clear()
 
             self._was_silent = silent
 
             silence_remaining = 0.0
-            if not self.manual_confirm and self.pending_tokens and self.last_motion_at is not None and not silent:
-                silence_remaining = max(0.0, self.silence_threshold - (job.captured_at - self.last_motion_at))
+            if not self.manual_confirm and self.pending_tokens:
+                if self.auto_commit_seconds > 0.0 and self._candidate_started_at is not None:
+                    silence_remaining = max(0.0, self.auto_commit_seconds - (job.captured_at - self._candidate_started_at))
+                elif self.last_motion_at is not None and not silent:
+                    silence_remaining = max(0.0, self.silence_threshold - (job.captured_at - self.last_motion_at))
 
             gesture_elapsed = 0.0
             if self._turn_started_at is not None and not silent:
@@ -568,6 +594,8 @@ class RealtimeRecognizer:
             self.pending_tokens.clear()
             self._turn_scores.clear()
             self._turn_started_at = None
+            self._candidate_started_at = None
+            self._missing_hand_frames = 0
             self._cooldown_until = 0.0
             self._was_silent = False
             self._worker_confidence = 0.0
@@ -740,14 +768,42 @@ class RealtimeRecognizer:
                     self._turn_scores[existing_tok] *= 0.85
                 self._turn_scores[candidate] += confidence
                 best_turn_token = max(self._turn_scores, key=lambda tok: self._turn_scores[tok])
+                if not self.pending_tokens or self.pending_tokens[-1] != best_turn_token:
+                    if now is not None:
+                        self._candidate_started_at = now
+                elif self._candidate_started_at is None and now is not None:
+                    self._candidate_started_at = now
                 self.pending_tokens = [best_turn_token]
             else:
                 if not self.pending_tokens or self.pending_tokens[-1] != candidate:
                     self.pending_tokens.append(candidate)
+                    if now is not None:
+                        self._candidate_started_at = now
+
+    def _frame_has_hand(self, features: np.ndarray) -> bool:
+        if not self.feature_config.use_hands:
+            return True
+        if features.shape[0] == 201:
+            return bool((features[75:201] != 0.0).any())
+        if features.shape[0] % 4 == 0 and features.shape[0] >= 168:
+            return bool((features[3:84:4] > 0.5).any() or (features[87:168:4] > 0.5).any())
+        return True
 
     def _update_motion(self, features: np.ndarray, current_time: float) -> None:
         if self.previous_features is not None:
-            if features.shape[0] % 4 == 0:
+            if features.shape[0] == 201 and self.feature_config.use_hands:
+                prev_hands = self.previous_features[75:201].reshape(-1, 3)
+                curr_hands = features[75:201].reshape(-1, 3)
+                prev_vis = (prev_hands != 0.0).any(axis=-1)
+                curr_vis = (curr_hands != 0.0).any(axis=-1)
+                both_vis = prev_vis & curr_vis
+                if both_vis.any():
+                    motion = float(np.linalg.norm(curr_hands[both_vis, :2] - prev_hands[both_vis, :2], axis=1).mean())
+                elif curr_vis.any() and not prev_vis.any():
+                    motion = self.motion_threshold
+                else:
+                    motion = 0.0
+            elif features.shape[0] % 4 == 0:
                 previous = self.previous_features.reshape(-1, 4)
                 current = features.reshape(-1, 4)
                 visible = (previous[:, 3] > 0.5) & (current[:, 3] > 0.5)
@@ -798,7 +854,7 @@ class RealtimeRecognizer:
         candidate_text: str = "",
     ) -> str:
         if cooldown_remaining > 0.0:
-            return f"Đã lưu từ! Nghỉ hạ tay: còn {cooldown_remaining:.1f}s"
+            return f"Đã in từ! Chờ nhịp tiếp theo: còn {cooldown_remaining:.1f}s"
         if self.manual_confirm:
             if candidate_text:
                 if not silent and gesture_elapsed > 0.0:
@@ -807,13 +863,13 @@ class RealtimeRecognizer:
             if gesture_elapsed > 0.0 and not silent:
                 return f"Đang phân tích động tác: {gesture_elapsed:.1f}s..."
             return "Sẵn sàng (0.0s) - Hãy làm 1 động tác rồi nhấn ENTER để lưu vào câu"
-        if self.pending_tokens and silence_remaining > 0.0:
-            return f"Thời gian lượt: {gesture_elapsed:.1f}s  |  Giữ yên/hạ tay để chốt: còn {silence_remaining:.1f}s"
+        if candidate_text and silence_remaining > 0.0:
+            return f"Đang nhận diện '{candidate_text}' ({gesture_elapsed:.1f}s)  |  Tự động chốt sau: {silence_remaining:.1f}s"
         if gesture_elapsed > 0.0 and not silent:
-            return f"Đang thực hiện động tác: {gesture_elapsed:.1f}s  (Dừng tay {self.silence_threshold:.1f}s để chốt)"
+            return f"Đang thực hiện động tác: {gesture_elapsed:.1f}s..."
         if silent:
             return "Đã kết thúc lượt (0.0s)  |  Sẵn sàng nhận ký hiệu tiếp theo"
-        return f"Sẵn sàng (0.0s)  |  Mỗi lượt giữ/dừng tay {self.silence_threshold:.1f}s để chốt từ"
+        return "Sẵn sàng (0.0s)  |  Làm bước nào sẽ tự động in chữ ra bước đó"
 
     def _draw_status(
         self,
@@ -849,15 +905,15 @@ class RealtimeRecognizer:
             ]
         else:
             rows = [
-                "Hỗ trợ giao tiếp bằng ngôn ngữ ký hiệu",
-                f"Ký hiệu nhận diện: {signs or '...'}",
-                f"Câu tiếng Việt (thử nghiệm): {translation or '...'}",
+                "Hỗ trợ giao tiếp bằng ngôn ngữ ký hiệu (Tự động in chữ theo từng bước)",
+                f"Bước đang nhận diện: {candidate_text or signs or '...'}",
+                f"Văn bản hiện tại: {translation or committed_text or '...'}",
                 f"Bộ đếm nhịp: {timer_line}",
                 f"Tin cậy: {confidence:.1%}  AI: {processing_fps:.1f} FPS  Camera: {self.camera_fps:.1f} FPS  Trễ: {latency_ms:.1f} ms",
                 f"Thiết bị: {self.device_label}" + ("  Đã kết thúc lượt ký hiệu" if silent else ""),
-                "R: Xóa   L: Khung xương   S: Đọc lại   Q/Esc: Thoát"
+                "Backspace: Xóa 1 từ   R: Xóa hết   L: Khung xương   S: Đọc lại   Q/Esc: Thoát"
                 if self.config.get("tts", {}).get("enabled", False)
-                else "R: Xóa   L: Khung xương   Q/Esc: Thoát",
+                else "Backspace: Xóa 1 từ   R: Xóa hết   L: Khung xương   Q/Esc: Thoát",
             ]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(rgb).convert("RGBA")
@@ -870,9 +926,9 @@ class RealtimeRecognizer:
         draw_probe = ImageDraw.Draw(image)
         lines: list[tuple[str, tuple[int, int, int, int]]] = []
         for row_idx, row in enumerate(rows):
-            if self.manual_confirm and row_idx == 1 and candidate_text:
+            if row_idx == 1 and (candidate_text or signs):
                 color = (255, 230, 80, 255)  # Yellow highlight for active candidate word
-            elif self.manual_confirm and row_idx == 2 and (translation or committed_text):
+            elif row_idx == 2 and (translation or committed_text):
                 color = (100, 255, 160, 255)  # Green highlight for saved sentence
             elif row_idx == 3:
                 color = (130, 235, 255, 255)  # Cyan for timer/guide line
